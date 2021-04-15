@@ -1,17 +1,12 @@
 use pyo3::class::PyGCProtocol;
 use pyo3::class::PyTraverseError;
 use pyo3::class::PyVisit;
-use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::python::ToPyPointer;
-use pyo3::types::PyObjectRef;
-use pyo3::types::PyTuple;
-use pyo3::PyRawObject;
-use std::cell::RefCell;
+use pyo3::type_object::PyTypeObject;
+use pyo3::{py_run, AsPyPointer, PyCell, PyTryInto};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[macro_use]
 mod common;
 
 #[pyclass(freelist = 2)]
@@ -85,67 +80,22 @@ fn data_is_dropped() {
     assert!(drop_called2.load(Ordering::Relaxed));
 }
 
-#[pyclass]
-struct ClassWithDrop {}
-
-impl Drop for ClassWithDrop {
-    fn drop(&mut self) {
-        unsafe {
-            let py = Python::assume_gil_acquired();
-
-            let _empty1 = PyTuple::empty(py);
-            let _empty2: PyObject = PyTuple::empty(py).into();
-            let _empty3: &PyObjectRef = py.from_owned_ptr(ffi::PyTuple_New(0));
-        }
-    }
-}
-
-// Test behavior of pythonrun::register_pointers + typeob::dealloc
-#[test]
-fn create_pointers_in_drop() {
-    let _gil = Python::acquire_gil();
-
-    let ptr;
-    let cnt;
-    {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
-        let empty = PyTuple::empty(py);
-        ptr = empty.as_ptr();
-        cnt = empty.get_refcnt() - 1;
-        let inst = Py::new(py, ClassWithDrop {}).unwrap();
-        drop(inst);
-    }
-
-    // empty1 and empty2 are still alive (stored in pointers list)
-    {
-        let _gil = Python::acquire_gil();
-        assert_eq!(cnt + 2, unsafe { ffi::Py_REFCNT(ptr) });
-    }
-
-    // empty1 and empty2 should be released
-    {
-        let _gil = Python::acquire_gil();
-        assert_eq!(cnt, unsafe { ffi::Py_REFCNT(ptr) });
-    }
-}
-
 #[allow(dead_code)]
 #[pyclass]
-struct GCIntegration {
-    self_ref: RefCell<PyObject>,
+struct GcIntegration {
+    self_ref: PyObject,
     dropped: TestDropCall,
 }
 
 #[pyproto]
-impl PyGCProtocol for GCIntegration {
+impl PyGCProtocol for GcIntegration {
     fn __traverse__(&self, visit: PyVisit) -> Result<(), PyTraverseError> {
-        visit.call(&*self.self_ref.borrow())
+        visit.call(&self.self_ref)
     }
 
     fn __clear__(&mut self) {
-        let gil = GILGuard::acquire();
-        *self.self_ref.borrow_mut() = gil.python().None();
+        let gil = Python::acquire_gil();
+        self.self_ref = gil.python().None();
     }
 }
 
@@ -156,10 +106,10 @@ fn gc_integration() {
     {
         let gil = Python::acquire_gil();
         let py = gil.python();
-        let inst = PyRef::new(
+        let inst = PyCell::new(
             py,
-            GCIntegration {
-                self_ref: RefCell::new(py.None()),
+            GcIntegration {
+                self_ref: py.None(),
                 dropped: TestDropCall {
                     drop_called: Arc::clone(&drop_called),
                 },
@@ -167,7 +117,8 @@ fn gc_integration() {
         )
         .unwrap();
 
-        *inst.self_ref.borrow_mut() = inst.to_object(py);
+        let mut borrow = inst.borrow_mut();
+        borrow.self_ref = inst.to_object(py);
     }
 
     let gil = Python::acquire_gil();
@@ -177,27 +128,33 @@ fn gc_integration() {
 }
 
 #[pyclass(gc)]
-struct GCIntegration2 {}
+struct GcIntegration2 {}
+
+#[pyproto]
+impl PyGCProtocol for GcIntegration2 {
+    fn __traverse__(&self, _visit: PyVisit) -> Result<(), PyTraverseError> {
+        Ok(())
+    }
+    fn __clear__(&mut self) {}
+}
 
 #[test]
 fn gc_integration2() {
     let gil = Python::acquire_gil();
     let py = gil.python();
-    // Temporarily disable pythons garbage collector to avoid a race condition
-    py.run("import gc; gc.disable()", None, None).unwrap();
-    let inst = PyRef::new(py, GCIntegration2 {}).unwrap();
-    py_run!(py, inst, "assert inst in gc.get_objects()");
-    py.run("gc.enable()", None, None).unwrap();
+    let inst = PyCell::new(py, GcIntegration2 {}).unwrap();
+    py_run!(py, inst, "import gc; assert inst in gc.get_objects()");
 }
 
-#[pyclass(weakref)]
+#[pyclass(weakref, subclass)]
 struct WeakRefSupport {}
 
 #[test]
+#[cfg_attr(all(Py_LIMITED_API, not(Py_3_9)), ignore)]
 fn weakref_support() {
     let gil = Python::acquire_gil();
     let py = gil.python();
-    let inst = PyRef::new(py, WeakRefSupport {}).unwrap();
+    let inst = PyCell::new(py, WeakRefSupport {}).unwrap();
     py_run!(
         py,
         inst,
@@ -205,7 +162,26 @@ fn weakref_support() {
     );
 }
 
-#[pyclass]
+// If the base class has weakref support, child class also has weakref.
+#[pyclass(extends=WeakRefSupport)]
+struct InheritWeakRef {
+    _value: usize,
+}
+
+#[test]
+#[cfg_attr(all(Py_LIMITED_API, not(Py_3_9)), ignore)]
+fn inherited_weakref() {
+    let gil = Python::acquire_gil();
+    let py = gil.python();
+    let inst = PyCell::new(py, (InheritWeakRef { _value: 0 }, WeakRefSupport {})).unwrap();
+    py_run!(
+        py,
+        inst,
+        "import weakref; assert weakref.ref(inst)() is inst"
+    );
+}
+
+#[pyclass(subclass)]
 struct BaseClassWithDrop {
     data: Option<Arc<AtomicBool>>,
 }
@@ -213,14 +189,14 @@ struct BaseClassWithDrop {
 #[pymethods]
 impl BaseClassWithDrop {
     #[new]
-    fn __new__(obj: &PyRawObject) -> PyResult<()> {
-        Ok(obj.init(BaseClassWithDrop { data: None }))
+    fn new() -> BaseClassWithDrop {
+        BaseClassWithDrop { data: None }
     }
 }
 
 impl Drop for BaseClassWithDrop {
     fn drop(&mut self) {
-        if let Some(ref mut data) = self.data {
+        if let Some(data) = &self.data {
             data.store(true, Ordering::Relaxed);
         }
     }
@@ -234,15 +210,17 @@ struct SubClassWithDrop {
 #[pymethods]
 impl SubClassWithDrop {
     #[new]
-    fn __new__(obj: &PyRawObject) -> PyResult<()> {
-        obj.init(SubClassWithDrop { data: None });
-        BaseClassWithDrop::__new__(obj)
+    fn new() -> (Self, BaseClassWithDrop) {
+        (
+            SubClassWithDrop { data: None },
+            BaseClassWithDrop { data: None },
+        )
     }
 }
 
 impl Drop for SubClassWithDrop {
     fn drop(&mut self) {
-        if let Some(ref mut data) = self.data {
+        if let Some(data) = &self.data {
             data.store(true, Ordering::Relaxed);
         }
     }
@@ -258,16 +236,79 @@ fn inheritance_with_new_methods_with_drop() {
         let py = gil.python();
         let _typebase = py.get_type::<BaseClassWithDrop>();
         let typeobj = py.get_type::<SubClassWithDrop>();
-        let inst = typeobj.call(NoArgs, None).unwrap();
+        let inst = typeobj.call((), None).unwrap();
 
-        let obj = SubClassWithDrop::try_from_mut(inst).unwrap();
-        obj.data = Some(Arc::clone(&drop_called1));
-
-        let base: &mut <SubClassWithDrop as pyo3::PyTypeInfo>::BaseType =
-            unsafe { py.mut_from_borrowed_ptr(inst.as_ptr()) };
+        let obj: &PyCell<SubClassWithDrop> = inst.try_into().unwrap();
+        let mut obj_ref_mut = obj.borrow_mut();
+        obj_ref_mut.data = Some(Arc::clone(&drop_called1));
+        let base: &mut BaseClassWithDrop = obj_ref_mut.as_mut();
         base.data = Some(Arc::clone(&drop_called2));
     }
 
     assert!(drop_called1.load(Ordering::Relaxed));
     assert!(drop_called2.load(Ordering::Relaxed));
+}
+
+#[pyclass(gc)]
+struct TraversableClass {
+    traversed: AtomicBool,
+}
+
+impl TraversableClass {
+    fn new() -> Self {
+        Self {
+            traversed: AtomicBool::new(false),
+        }
+    }
+}
+
+#[pyproto]
+impl PyGCProtocol for TraversableClass {
+    fn __clear__(&mut self) {}
+    fn __traverse__(&self, _visit: PyVisit) -> Result<(), PyTraverseError> {
+        self.traversed.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+unsafe fn get_type_traverse(tp: *mut pyo3::ffi::PyTypeObject) -> Option<pyo3::ffi::traverseproc> {
+    std::mem::transmute(pyo3::ffi::PyType_GetSlot(tp, pyo3::ffi::Py_tp_traverse))
+}
+
+#[test]
+fn gc_during_borrow() {
+    let gil = Python::acquire_gil();
+    let py = gil.python();
+
+    unsafe {
+        // declare a dummy visitor function
+        extern "C" fn novisit(
+            _object: *mut pyo3::ffi::PyObject,
+            _arg: *mut core::ffi::c_void,
+        ) -> std::os::raw::c_int {
+            0
+        }
+
+        // get the traverse function
+        let ty = TraversableClass::type_object(py).as_type_ptr();
+        let traverse = get_type_traverse(ty).unwrap();
+
+        // create an object and check that traversing it works normally
+        // when it's not borrowed
+        let cell = PyCell::new(py, TraversableClass::new()).unwrap();
+        let obj = cell.to_object(py);
+        assert!(!cell.borrow().traversed.load(Ordering::Relaxed));
+        traverse(obj.as_ptr(), novisit, std::ptr::null_mut());
+        assert!(cell.borrow().traversed.load(Ordering::Relaxed));
+
+        // create an object and check that it is not traversed if the GC
+        // is invoked while it is already borrowed mutably
+        let cell2 = PyCell::new(py, TraversableClass::new()).unwrap();
+        let obj2 = cell2.to_object(py);
+        let guard = cell2.borrow_mut();
+        assert!(!guard.traversed.load(Ordering::Relaxed));
+        traverse(obj2.as_ptr(), novisit, std::ptr::null_mut());
+        assert!(!guard.traversed.load(Ordering::Relaxed));
+        drop(guard);
+    }
 }

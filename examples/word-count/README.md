@@ -1,6 +1,6 @@
 # word-count
 
-Demonstrates searching for a file in plain python, with rust singlethreaded and with rust multithreaded. 
+Demonstrates searching for a file in plain python, with rust singlethreaded and with rust multithreaded.
 
 ## Build
 
@@ -11,11 +11,11 @@ python setup.py install
 ## Usage
 
 ```python
-from word_count import search_py, WordCounter
+from word_count import search_py, search, search_sequential
 
-search_py("path/to/file", "word")
-WordCounter("path/to/file").search("word")
-WordCounter("path/to/file").search_sequential("word")
+search_py("foo bar", "foo")
+search("foo bar", "foo")
+search_sequential("foo bar", "foo")
 ```
 
 ## Benchmark
@@ -35,8 +35,8 @@ pytest -v tests
 
 ## Testing
 
-To test python 2.7, 3.5, 3.6 and 3.7, install tox globally and run 
+To test install tox globally and run
 
 ```shell
-tox
+tox -e py
 ```

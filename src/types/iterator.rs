@@ -2,18 +2,13 @@
 //
 // based on Daniel Grunwald's https://github.com/dgrunwald/rust-cpython
 
-use crate::err::{PyDowncastError, PyErr, PyResult};
-use crate::ffi;
-use crate::instance::PyObjectWithGIL;
-use crate::python::{Python, ToPyPointer};
-use crate::types::PyObjectRef;
+use crate::{ffi, AsPyPointer, PyAny, PyErr, PyNativeType, PyResult, Python};
+#[cfg(any(not(Py_LIMITED_API), Py_3_8))]
+use crate::{PyDowncastError, PyTryFrom};
 
-/// A python iterator object.
+/// A Python iterator object.
 ///
-/// Unlike other python objects, this class includes a `Python<'p>` token
-/// so that `PyIterator` can implement the rust `Iterator` trait.
-///
-/// # Example
+/// # Examples
 ///
 /// ```rust
 /// # use pyo3::prelude::*;
@@ -23,37 +18,35 @@ use crate::types::PyObjectRef;
 /// let gil = Python::acquire_gil();
 /// let py = gil.python();
 /// let list = py.eval("iter([1, 2, 3, 4])", None, None)?;
-/// let numbers: PyResult<Vec<usize>> = list.iter()?.map(|i| i.and_then(ObjectProtocol::extract::<usize>)).collect();
+/// let numbers: PyResult<Vec<usize>> = list.iter()?.map(|i| i.and_then(PyAny::extract::<usize>)).collect();
 /// let sum: usize = numbers?.iter().sum();
 /// assert_eq!(sum, 10);
 /// # Ok(())
 /// # }
 /// ```
-pub struct PyIterator<'p>(&'p PyObjectRef);
+#[repr(transparent)]
+pub struct PyIterator(PyAny);
+pyobject_native_type_named!(PyIterator);
+#[cfg(any(not(Py_LIMITED_API), Py_3_8))]
+pyobject_native_type_extract!(PyIterator);
 
-impl<'p> PyIterator<'p> {
-    /// Constructs a `PyIterator` from a Python iterator object.
-    pub fn from_object<T>(py: Python<'p>, obj: &T) -> Result<PyIterator<'p>, PyDowncastError>
+impl PyIterator {
+    /// Constructs a `PyIterator` from a Python iterable object.
+    ///
+    /// Equivalent to Python's built-in `iter` function.
+    pub fn from_object<'p, T>(py: Python<'p>, obj: &T) -> PyResult<&'p PyIterator>
     where
-        T: ToPyPointer,
+        T: AsPyPointer,
     {
-        unsafe {
-            let ptr = ffi::PyObject_GetIter(obj.as_ptr());
-
-            if ffi::PyIter_Check(ptr) != 0 {
-                // this is not right, but this cause of segfault check #71
-                Ok(PyIterator(py.from_borrowed_ptr(ptr)))
-            } else {
-                Err(PyDowncastError)
-            }
-        }
+        unsafe { py.from_owned_ptr_or_err(ffi::PyObject_GetIter(obj.as_ptr())) }
     }
 }
 
-impl<'p> Iterator for PyIterator<'p> {
-    type Item = PyResult<&'p PyObjectRef>;
+impl<'p> Iterator for &'p PyIterator {
+    type Item = PyResult<&'p PyAny>;
 
     /// Retrieves the next item from an iterator.
+    ///
     /// Returns `None` when the iterator is exhausted.
     /// If an exception occurs, returns `Some(Err(..))`.
     /// Further `next()` calls after an exception occurs are likely
@@ -74,24 +67,41 @@ impl<'p> Iterator for PyIterator<'p> {
     }
 }
 
-/// Dropping a `PyIterator` instance decrements the reference count on the object by 1.
-impl<'p> Drop for PyIterator<'p> {
-    fn drop(&mut self) {
-        unsafe { ffi::Py_DECREF(self.0.as_ptr()) }
+// PyIter_Check does not exist in the limited API until 3.8
+#[cfg(any(not(Py_LIMITED_API), Py_3_8))]
+impl<'v> PyTryFrom<'v> for PyIterator {
+    fn try_from<V: Into<&'v PyAny>>(value: V) -> Result<&'v PyIterator, PyDowncastError<'v>> {
+        let value = value.into();
+        unsafe {
+            if ffi::PyIter_Check(value.as_ptr()) != 0 {
+                Ok(<PyIterator as PyTryFrom>::try_from_unchecked(value))
+            } else {
+                Err(PyDowncastError::new(value, "Iterator"))
+            }
+        }
+    }
+
+    fn try_from_exact<V: Into<&'v PyAny>>(value: V) -> Result<&'v PyIterator, PyDowncastError<'v>> {
+        <PyIterator as PyTryFrom>::try_from(value)
+    }
+
+    #[inline]
+    unsafe fn try_from_unchecked<V: Into<&'v PyAny>>(value: V) -> &'v PyIterator {
+        let ptr = value.into() as *const _ as *const PyIterator;
+        &*ptr
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
-
-    use crate::conversion::ToPyObject;
-    use crate::instance::AsPyRef;
-    use crate::objectprotocol::ObjectProtocol;
-    use crate::python::Python;
-    use crate::pythonrun::GILPool;
+    use super::PyIterator;
+    use crate::exceptions::PyTypeError;
+    use crate::gil::GILPool;
     use crate::types::{PyDict, PyList};
-    use crate::GILGuard;
+    #[cfg(any(not(Py_LIMITED_API), Py_3_8))]
+    use crate::{Py, PyAny, PyTryFrom};
+    use crate::{Python, ToPyObject};
+    use indoc::indoc;
 
     #[test]
     fn vec_iter() {
@@ -113,7 +123,7 @@ mod tests {
             let gil_guard = Python::acquire_gil();
             let py = gil_guard.python();
             obj = vec![10, 20].to_object(py);
-            count = obj.get_refcnt();
+            count = obj.get_refcnt(py);
         }
 
         {
@@ -124,7 +134,7 @@ mod tests {
 
             assert_eq!(10, it.next().unwrap().unwrap().extract().unwrap());
         }
-        assert_eq!(count, obj.get_refcnt());
+        assert_eq!(count, obj.get_refcnt(Python::acquire_gil().python()));
     }
 
     #[test]
@@ -136,24 +146,24 @@ mod tests {
         let none;
         let count;
         {
-            let _pool = GILPool::new();
+            let _pool = unsafe { GILPool::new() };
             let l = PyList::empty(py);
             none = py.None();
             l.append(10).unwrap();
             l.append(&none).unwrap();
-            count = none.get_refcnt();
+            count = none.get_refcnt(py);
             obj = l.to_object(py);
         }
 
         {
-            let _pool = GILPool::new();
+            let _pool = unsafe { GILPool::new() };
             let inst = obj.as_ref(py);
             let mut it = inst.iter().unwrap();
 
             assert_eq!(10, it.next().unwrap().unwrap().extract().unwrap());
             assert!(it.next().unwrap().unwrap().is_none());
         }
-        assert_eq!(count, none.get_refcnt());
+        assert_eq!(count, none.get_refcnt(py));
     }
 
     #[test]
@@ -169,7 +179,7 @@ mod tests {
         "#
         );
 
-        let gil = GILGuard::acquire();
+        let gil = Python::acquire_gil();
         let py = gil.python();
 
         let context = PyDict::new(py);
@@ -180,5 +190,26 @@ mod tests {
             let actual = actual.unwrap().extract::<usize>().unwrap();
             assert_eq!(actual, *expected)
         }
+    }
+
+    #[test]
+    fn int_not_iterable() {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+
+        let x = 5.to_object(py);
+        let err = PyIterator::from_object(py, &x).unwrap_err();
+
+        assert!(err.is_instance::<PyTypeError>(py))
+    }
+
+    #[test]
+    #[cfg(any(not(Py_LIMITED_API), Py_3_8))]
+    fn iterator_try_from() {
+        let gil_guard = Python::acquire_gil();
+        let py = gil_guard.python();
+        let obj: Py<PyAny> = vec![10, 20].to_object(py).as_ref(py).iter().unwrap().into();
+        let iter: &PyIterator = PyIterator::try_from(obj.as_ref(py)).unwrap();
+        assert_eq!(obj, iter.into());
     }
 }

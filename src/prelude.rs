@@ -10,22 +10,14 @@
 //! use pyo3::prelude::*;
 //! ```
 
-pub use crate::conversion::{FromPyObject, IntoPyObject, PyTryFrom, PyTryInto, ToPyObject};
 pub use crate::err::{PyErr, PyResult};
-pub use crate::instance::{AsPyRef, Py, PyRef, PyRefMut};
-pub use crate::noargs::NoArgs;
-pub use crate::object::PyObject;
-pub use crate::objectprotocol::ObjectProtocol;
+pub use crate::gil::GILGuard;
+pub use crate::instance::{Py, PyObject};
+pub use crate::pycell::{PyCell, PyRef, PyRefMut};
+pub use crate::pyclass_init::PyClassInitializer;
 pub use crate::python::Python;
-pub use crate::pythonrun::GILGuard;
-// This is only part of the prelude because we need it for the pymodule function
-pub use crate::types::PyModule;
-// This is required for the constructor
-pub use crate::PyRawObject;
-pub use pyo3cls::{pyclass, pyfunction, pymethods, pyproto};
-
-#[cfg(Py_3)]
-pub use pyo3cls::pymodule3 as pymodule;
-
-#[cfg(not(Py_3))]
-pub use pyo3cls::pymodule2 as pymodule;
+pub use crate::{FromPyObject, IntoPy, IntoPyPointer, PyTryFrom, PyTryInto, ToPyObject};
+// PyModule is only part of the prelude because we need it for the pymodule function
+pub use crate::types::{PyAny, PyModule};
+#[cfg(feature = "macros")]
+pub use {crate::proc_macro::*, pyo3_macros::FromPyObject};

@@ -1,80 +1,99 @@
 // Copyright (c) 2017-present PyO3 Project and Contributors
 
-//! Various types defined by the python interpreter such as `int`, `str` and `tuple`
+//! Various types defined by the Python interpreter such as `int`, `str` and `tuple`.
 
+pub use self::any::PyAny;
 pub use self::boolobject::PyBool;
 pub use self::bytearray::PyByteArray;
+pub use self::bytes::PyBytes;
 pub use self::complex::PyComplex;
-pub use self::datetime::PyDeltaAccess;
+#[cfg(not(Py_LIMITED_API))]
 pub use self::datetime::{
-    PyDate, PyDateAccess, PyDateTime, PyDelta, PyTime, PyTimeAccess, PyTzInfo,
+    PyDate, PyDateAccess, PyDateTime, PyDelta, PyDeltaAccess, PyTime, PyTimeAccess, PyTzInfo,
 };
 pub use self::dict::{IntoPyDict, PyDict};
 pub use self::floatob::PyFloat;
+pub use self::function::{PyCFunction, PyFunction};
 pub use self::iterator::PyIterator;
 pub use self::list::PyList;
 pub use self::module::PyModule;
-#[cfg(not(Py_3))]
-pub use self::num2::{PyInt, PyLong};
-#[cfg(Py_3)]
-pub use self::num3::PyLong;
-#[cfg(Py_3)]
-pub use self::num3::PyLong as PyInt;
+pub use self::num::PyLong;
+pub use self::num::PyLong as PyInt;
 pub use self::sequence::PySequence;
 pub use self::set::{PyFrozenSet, PySet};
 pub use self::slice::{PySlice, PySliceIndices};
-#[cfg(Py_3)]
-pub use self::string::{PyBytes, PyString, PyString as PyUnicode};
-#[cfg(not(Py_3))]
-pub use self::string2::{PyBytes, PyString, PyUnicode};
+pub use self::string::{PyString, PyString as PyUnicode};
 pub use self::tuple::PyTuple;
 pub use self::typeobject::PyType;
-use crate::ffi;
-use crate::python::ToPyPointer;
-use crate::PyObject;
 
-/// Implements a typesafe conversions throught [FromPyObject], given a typecheck function as second
-/// parameter
+// Implementations core to all native types
 #[macro_export]
-macro_rules! pyobject_downcast (
-    ($name: ty, $checkfunction: path $(,$type_param: ident)*) => (
-        impl<'a, $($type_param,)*> $crate::FromPyObject<'a> for &'a $name
-        {
-            /// Extracts `Self` from the source `PyObject`.
-            fn extract(ob: &'a $crate::types::PyObjectRef) -> $crate::PyResult<Self>
+macro_rules! pyobject_native_type_base(
+    ($name: ty $(;$generics: ident)* ) => {
+        unsafe impl<$($generics,)*> $crate::PyNativeType for $name {}
+
+        impl<$($generics,)*> std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter)
+                   -> std::result::Result<(), std::fmt::Error>
             {
-                unsafe {
-                    if $checkfunction(ob.as_ptr()) != 0 {
-                        Ok(&*(ob as *const $crate::types::PyObjectRef as *const $name))
-                    } else {
-                        Err($crate::PyDowncastError.into())
-                    }
-                }
+                let s = self.repr().map_err(|_| std::fmt::Error)?;
+                f.write_str(&s.to_string_lossy())
             }
         }
-    );
+
+        impl<$($generics,)*> std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter)
+                   -> std::result::Result<(), std::fmt::Error>
+            {
+                let s = self.str().map_err(|_| std::fmt::Error)?;
+                f.write_str(&s.to_string_lossy())
+            }
+        }
+
+        impl<$($generics,)*> $crate::ToPyObject for $name
+        {
+            #[inline]
+            fn to_object(&self, py: $crate::Python) -> $crate::PyObject {
+                use $crate::AsPyPointer;
+                unsafe { $crate::PyObject::from_borrowed_ptr(py, self.as_ptr()) }
+            }
+        }
+
+        impl<$($generics,)*> PartialEq for $name {
+            #[inline]
+            fn eq(&self, o: &$name) -> bool {
+                use $crate::AsPyPointer;
+
+                self.as_ptr() == o.as_ptr()
+            }
+        }
+    };
 );
 
+// Implementations core to all native types except for PyAny (because they don't
+// make sense on PyAny / have different implementations).
 #[macro_export]
 macro_rules! pyobject_native_type_named (
-    ($name: ty $(,$type_param: ident)*) => {
-        impl<$($type_param,)*> $crate::PyNativeType for $name {}
+    ($name: ty $(;$generics: ident)*) => {
+        $crate::pyobject_native_type_base!($name $(;$generics)*);
 
-        impl<$($type_param,)*> ::std::convert::AsRef<$crate::types::PyObjectRef> for $name {
+        impl<$($generics,)*> std::convert::AsRef<$crate::PyAny> for $name {
             #[inline]
-            fn as_ref(&self) -> &$crate::types::PyObjectRef {
-                unsafe{&*(self as *const $name as *const $crate::types::PyObjectRef)}
+            fn as_ref(&self) -> &$crate::PyAny {
+                &self.0
             }
         }
 
-        impl<$($type_param,)*> $crate::PyObjectWithGIL for $name {
+        impl<$($generics,)*> std::ops::Deref for $name {
+            type Target = $crate::PyAny;
+
             #[inline]
-            fn py(&self) -> $crate::Python {
-                unsafe { $crate::Python::assume_gil_acquired() }
+            fn deref(&self) -> &$crate::PyAny {
+                &self.0
             }
         }
 
-        impl<$($type_param,)*> $crate::python::ToPyPointer for $name {
+        impl<$($generics,)*> $crate::AsPyPointer for $name {
             /// Gets the underlying FFI pointer, returns a borrowed pointer.
             #[inline]
             fn as_ptr(&self) -> *mut $crate::ffi::PyObject {
@@ -82,125 +101,146 @@ macro_rules! pyobject_native_type_named (
             }
         }
 
-        impl<$($type_param,)*> PartialEq for $name {
+        impl<$($generics,)*> $crate::IntoPy<$crate::Py<$name>> for &'_ $name {
             #[inline]
-            fn eq(&self, o: &$name) -> bool {
-                self.as_ptr() == o.as_ptr()
+            fn into_py(self, py: $crate::Python) -> $crate::Py<$name> {
+                use $crate::AsPyPointer;
+                unsafe { $crate::Py::from_borrowed_ptr(py, self.as_ptr()) }
             }
         }
-    };
-);
 
-#[macro_export]
-macro_rules! pyobject_native_type (
-    ($name: ty, $typeobject: expr, $checkfunction: path $(,$type_param: ident)*) => {
-        pyobject_native_type_named!($name $(,$type_param)*);
-        pyobject_native_type_convert!($name, $typeobject, $checkfunction $(,$type_param)*);
+        impl<$($generics,)*> From<&'_ $name> for $crate::Py<$name> {
+            #[inline]
+            fn from(other: &$name) -> Self {
+                use $crate::AsPyPointer;
+                use $crate::PyNativeType;
+                unsafe { $crate::Py::from_borrowed_ptr(other.py(), other.as_ptr()) }
+            }
+        }
 
-        impl<'a, $($type_param,)*> ::std::convert::From<&'a $name> for &'a $crate::types::PyObjectRef {
+        impl<'a, $($generics,)*> std::convert::From<&'a $name> for &'a $crate::PyAny {
             fn from(ob: &'a $name) -> Self {
-                unsafe{&*(ob as *const $name as *const $crate::types::PyObjectRef)}
+                unsafe{&*(ob as *const $name as *const $crate::PyAny)}
             }
         }
     };
 );
 
 #[macro_export]
-macro_rules! pyobject_native_type_convert(
-    ($name: ty, $typeobject: expr, $checkfunction: path $(,$type_param: ident)*) => {
-        impl<$($type_param,)*> $crate::typeob::PyTypeInfo for $name {
-            type Type = ();
-            type BaseType = $crate::types::PyObjectRef;
+macro_rules! pyobject_native_type_core {
+    ($name: ty, $layout: path, $typeobject: expr, $module: expr $(, $checkfunction:path)? $(;$generics: ident)*) => {
+        unsafe impl $crate::type_object::PyLayout<$name> for $layout {}
+        $crate::pyobject_native_type_named!($name $(;$generics)*);
+        $crate::pyobject_native_type_info!($name, $layout, $typeobject, $module $(, $checkfunction)? $(;$generics)*);
+        $crate::pyobject_native_type_extract!($name $(;$generics)*);
+    }
+}
+
+#[macro_export]
+macro_rules! pyobject_native_type_sized {
+    ($name: ty, $layout: path $(;$generics: ident)*) => {
+        // To prevent inheriting native types with ABI3
+        #[cfg(not(Py_LIMITED_API))]
+        impl $crate::type_object::PySizedLayout<$name> for $layout {}
+        impl<'a, $($generics,)*> $crate::derive_utils::PyBaseTypeUtils for $name {
+            type Dict = $crate::pyclass_slots::PyClassDummySlot;
+            type WeakRef = $crate::pyclass_slots::PyClassDummySlot;
+            type LayoutAsBase = $crate::pycell::PyCellBase<$name>;
+            type BaseNativeType = $name;
+            type ThreadChecker = $crate::class::impl_::ThreadCheckerStub<$crate::PyObject>;
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! pyobject_native_type {
+    ($name: ty, $layout: path, $typeobject: expr, $module: expr, $checkfunction:path $(;$generics: ident)*) => {
+        $crate::pyobject_native_type_core!($name, $layout, $typeobject, $module, $checkfunction $(;$generics)*);
+        $crate::pyobject_native_type_sized!($name, $layout $(;$generics)*);
+    };
+    ($name: ty, $layout: path, $typeobject: expr, $checkfunction:path $(;$generics: ident)*) => {
+        $crate::pyobject_native_type! {
+            $name, $layout, $typeobject, Some("builtins"), $checkfunction $(;$generics)*
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! pyobject_native_var_type {
+    ($name: ty, $typeobject: expr, $module: expr, $checkfunction:path $(;$generics: ident)*) => {
+        $crate::pyobject_native_type_core!(
+            $name, $crate::ffi::PyObject, $typeobject, Some("builtins"), $checkfunction $(;$generics)*);
+    };
+    ($name: ty, $typeobject: expr, $checkfunction: path $(;$generics: ident)*) => {
+        $crate::pyobject_native_var_type! {
+            $name, $typeobject, Some("builtins"), $checkfunction $(;$generics)*
+        }
+    };
+}
+
+// NOTE: This macro is not included in pyobject_native_type_base!
+// because rust-numpy has a special implementation.
+#[macro_export]
+macro_rules! pyobject_native_type_extract {
+    ($name: ty $(;$generics: ident)*) => {
+        impl<'py, $($generics,)*> $crate::FromPyObject<'py> for &'py $name {
+            fn extract(obj: &'py $crate::PyAny) -> $crate::PyResult<Self> {
+                $crate::PyTryFrom::try_from(obj).map_err(Into::into)
+            }
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! pyobject_native_type_info(
+    ($name: ty, $layout: path, $typeobject: expr,
+     $module: expr $(, $checkfunction:path)? $(;$generics: ident)*) => {
+        unsafe impl<$($generics,)*> $crate::type_object::PyTypeInfo for $name {
+            type BaseType = $crate::PyAny;
+            type Layout = $layout;
+            type BaseLayout = $crate::ffi::PyObject;
+            type Initializer = $crate::pyclass_init::PyNativeTypeInitializer<Self>;
+            type AsRefTarget = Self;
 
             const NAME: &'static str = stringify!($name);
-            const SIZE: usize = ::std::mem::size_of::<$crate::ffi::PyObject>();
-            const OFFSET: isize = 0;
+            const MODULE: Option<&'static str> = $module;
 
             #[inline]
-            unsafe fn type_object() -> &'static mut $crate::ffi::PyTypeObject {
-                &mut $typeobject
+            fn type_object_raw(_py: $crate::Python) -> *mut $crate::ffi::PyTypeObject {
+                // Create a very short lived mutable reference and directly
+                // cast it to a pointer: no mutable references can be aliasing
+                // because we hold the GIL.
+                unsafe { &mut $typeobject }
             }
 
-            fn is_instance(ptr: &$crate::types::PyObjectRef) -> bool {
-                #[allow(unused_unsafe)]
-                unsafe { $checkfunction(ptr.as_ptr()) > 0 }
-            }
-        }
-
-        impl<$($type_param,)*> $crate::typeob::PyObjectAlloc for $name {}
-
-        impl<$($type_param,)*> $crate::typeob::PyTypeObject for $name {
-            fn init_type() -> std::ptr::NonNull<$crate::ffi::PyTypeObject> {
-                unsafe {
-                    std::ptr::NonNull::new_unchecked(<Self as $crate::typeob::PyTypeInfo>::type_object() as *mut _)
+            $(
+                fn is_type_of(ptr: &$crate::PyAny) -> bool {
+                    use $crate::AsPyPointer;
+                    #[allow(unused_unsafe)]
+                    unsafe { $checkfunction(ptr.as_ptr()) > 0 }
                 }
-            }
-        }
-
-        impl<$($type_param,)*> $crate::ToPyObject for $name
-        {
-            #[inline]
-            fn to_object(&self, py: $crate::Python) -> $crate::PyObject {
-                unsafe {$crate::PyObject::from_borrowed_ptr(py, self.0.as_ptr())}
-            }
-        }
-
-        impl<$($type_param,)*> ::std::fmt::Debug for $name {
-            fn fmt(&self, f: &mut ::std::fmt::Formatter)
-                   -> Result<(), ::std::fmt::Error>
-            {
-                use $crate::ObjectProtocol;
-                let s = self.repr().map_err(|_| ::std::fmt::Error)?;
-                f.write_str(&s.to_string_lossy())
-            }
-        }
-
-        impl<$($type_param,)*> ::std::fmt::Display for $name {
-            fn fmt(&self, f: &mut ::std::fmt::Formatter)
-                   -> Result<(), ::std::fmt::Error>
-            {
-                use $crate::ObjectProtocol;
-                let s = self.str().map_err(|_| ::std::fmt::Error)?;
-                f.write_str(&s.to_string_lossy())
-            }
+            )?
         }
     };
 );
 
-/// Represents general python instance.
-#[repr(transparent)]
-pub struct PyObjectRef(PyObject);
-pyobject_native_type_named!(PyObjectRef);
-pyobject_native_type_convert!(PyObjectRef, ffi::PyBaseObject_Type, ffi::PyObject_Check);
-
+mod any;
 mod boolobject;
 mod bytearray;
+mod bytes;
 mod complex;
+#[cfg(not(Py_LIMITED_API))]
 mod datetime;
 mod dict;
-pub mod exceptions;
 mod floatob;
+mod function;
 mod iterator;
 mod list;
 mod module;
+mod num;
 mod sequence;
 mod set;
 mod slice;
-mod stringutils;
+mod string;
 mod tuple;
 mod typeobject;
-
-#[macro_use]
-mod num_common;
-
-#[cfg(Py_3)]
-mod num3;
-
-#[cfg(not(Py_3))]
-mod num2;
-
-#[cfg(Py_3)]
-mod string;
-
-#[cfg(not(Py_3))]
-mod string2;

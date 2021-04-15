@@ -2,38 +2,37 @@
 
 //! Python Async/Await Interface.
 //!
-//! Check [python c-api information](
+//! Check [the Python C API information](
 //! https://docs.python.org/3/c-api/typeobj.html#async-object-structures)
 //!
 //! [PEP-0492](https://www.python.org/dev/peps/pep-0492/)
 //!
 
-use crate::callback::PyObjectCallbackConverter;
-use crate::class::methods::PyMethodDef;
+use crate::callback::IntoPyCallbackOutput;
+use crate::derive_utils::TryFromPyCell;
 use crate::err::PyResult;
-use crate::ffi;
-use crate::typeob::PyTypeInfo;
+use crate::{ffi, IntoPy, IntoPyPointer, PyClass, PyObject, Python};
 
 /// Python Async/Await support interface.
 ///
 /// Each method in this trait corresponds to Python async/await implementation.
 #[allow(unused_variables)]
-pub trait PyAsyncProtocol<'p>: PyTypeInfo {
-    fn __await__(&'p self) -> Self::Result
+pub trait PyAsyncProtocol<'p>: PyClass {
+    fn __await__(slf: Self::Receiver) -> Self::Result
     where
         Self: PyAsyncAwaitProtocol<'p>,
     {
         unimplemented!()
     }
 
-    fn __aiter__(&'p self) -> Self::Result
+    fn __aiter__(slf: Self::Receiver) -> Self::Result
     where
         Self: PyAsyncAiterProtocol<'p>,
     {
         unimplemented!()
     }
 
-    fn __anext__(&'p mut self) -> Self::Result
+    fn __anext__(slf: Self::Receiver) -> Self::Result
     where
         Self: PyAsyncAnextProtocol<'p>,
     {
@@ -61,192 +60,75 @@ pub trait PyAsyncProtocol<'p>: PyTypeInfo {
 }
 
 pub trait PyAsyncAwaitProtocol<'p>: PyAsyncProtocol<'p> {
-    type Success: crate::IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Receiver: TryFromPyCell<'p, Self>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyAsyncAiterProtocol<'p>: PyAsyncProtocol<'p> {
-    type Success: crate::IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Receiver: TryFromPyCell<'p, Self>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyAsyncAnextProtocol<'p>: PyAsyncProtocol<'p> {
-    type Success: crate::IntoPyObject;
-    type Result: Into<PyResult<Option<Self::Success>>>;
+    type Receiver: TryFromPyCell<'p, Self>;
+    type Result: IntoPyCallbackOutput<PyIterANextOutput>;
 }
 
 pub trait PyAsyncAenterProtocol<'p>: PyAsyncProtocol<'p> {
-    type Success: crate::IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyAsyncAexitProtocol<'p>: PyAsyncProtocol<'p> {
     type ExcType: crate::FromPyObject<'p>;
     type ExcValue: crate::FromPyObject<'p>;
     type Traceback: crate::FromPyObject<'p>;
-    type Success: crate::IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
-#[cfg(Py_3)]
-#[doc(hidden)]
-pub trait PyAsyncProtocolImpl {
-    fn tp_as_async() -> Option<ffi::PyAsyncMethods> {
-        None
-    }
+py_unarys_func!(await_, PyAsyncAwaitProtocol, Self::__await__);
+py_unarys_func!(aiter, PyAsyncAiterProtocol, Self::__aiter__);
+py_unarys_func!(anext, PyAsyncAnextProtocol, Self::__anext__);
 
-    fn methods() -> Vec<PyMethodDef> {
-        Vec::new()
-    }
+/// Output of `__anext__`.
+pub enum IterANextOutput<T, U> {
+    Yield(T),
+    Return(U),
 }
 
-#[cfg(Py_3)]
-impl<T> PyAsyncProtocolImpl for T {}
+pub type PyIterANextOutput = IterANextOutput<PyObject, PyObject>;
 
-#[cfg(Py_3)]
-impl<'p, T> PyAsyncProtocolImpl for T
-where
-    T: PyAsyncProtocol<'p>,
-{
-    #[inline]
-    fn tp_as_async() -> Option<ffi::PyAsyncMethods> {
-        Some(ffi::PyAsyncMethods {
-            am_await: Self::am_await(),
-            am_aiter: Self::am_aiter(),
-            am_anext: Self::am_anext(),
-        })
-    }
-
-    #[inline]
-    fn methods() -> Vec<PyMethodDef> {
-        let mut methods = Vec::new();
-
-        if let Some(def) = <Self as PyAsyncAenterProtocolImpl>::__aenter__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyAsyncAexitProtocolImpl>::__aexit__() {
-            methods.push(def)
-        }
-
-        methods
-    }
-}
-
-trait PyAsyncAwaitProtocolImpl {
-    fn am_await() -> Option<ffi::unaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyAsyncAwaitProtocolImpl for T where T: PyAsyncProtocol<'p> {}
-
-impl<T> PyAsyncAwaitProtocolImpl for T
-where
-    T: for<'p> PyAsyncAwaitProtocol<'p>,
-{
-    #[inline]
-    fn am_await() -> Option<ffi::unaryfunc> {
-        py_unary_func!(
-            PyAsyncAwaitProtocol,
-            T::__await__,
-            <T as PyAsyncAwaitProtocol>::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyAsyncAiterProtocolImpl {
-    fn am_aiter() -> Option<ffi::unaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyAsyncAiterProtocolImpl for T where T: PyAsyncProtocol<'p> {}
-
-impl<T> PyAsyncAiterProtocolImpl for T
-where
-    T: for<'p> PyAsyncAiterProtocol<'p>,
-{
-    #[inline]
-    fn am_aiter() -> Option<ffi::unaryfunc> {
-        py_unary_func!(
-            PyAsyncAiterProtocol,
-            T::__aiter__,
-            <T as PyAsyncAiterProtocol>::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyAsyncAnextProtocolImpl {
-    fn am_anext() -> Option<ffi::unaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyAsyncAnextProtocolImpl for T where T: PyAsyncProtocol<'p> {}
-
-#[cfg(Py_3)]
-mod anext {
-    use super::{PyAsyncAnextProtocol, PyAsyncAnextProtocolImpl};
-    use crate::callback::CallbackConverter;
-    use crate::conversion::IntoPyObject;
-    use crate::ffi;
-    use crate::python::{IntoPyPointer, Python};
-    use std::ptr;
-
-    pub struct IterANextResultConverter;
-
-    impl<T> CallbackConverter<Option<T>> for IterANextResultConverter
-    where
-        T: IntoPyObject,
-    {
-        type R = *mut ffi::PyObject;
-
-        fn convert(val: Option<T>, py: Python) -> *mut ffi::PyObject {
-            match val {
-                Some(val) => val.into_object(py).into_ptr(),
-                None => unsafe {
-                    ffi::PyErr_SetNone(ffi::PyExc_StopAsyncIteration);
-                    ptr::null_mut()
-                },
+impl IntoPyCallbackOutput<*mut ffi::PyObject> for PyIterANextOutput {
+    fn convert(self, _py: Python) -> PyResult<*mut ffi::PyObject> {
+        match self {
+            IterANextOutput::Yield(o) => Ok(o.into_ptr()),
+            IterANextOutput::Return(opt) => {
+                Err(crate::exceptions::PyStopAsyncIteration::new_err((opt,)))
             }
         }
-
-        #[inline]
-        fn error_value() -> *mut ffi::PyObject {
-            ptr::null_mut()
-        }
     }
+}
 
-    impl<T> PyAsyncAnextProtocolImpl for T
-    where
-        T: for<'p> PyAsyncAnextProtocol<'p>,
-    {
-        #[inline]
-        fn am_anext() -> Option<ffi::unaryfunc> {
-            py_unary_func!(
-                PyAsyncAnextProtocol,
-                T::__anext__,
-                Option<T::Success>,
-                IterANextResultConverter
-            )
+impl<T, U> IntoPyCallbackOutput<PyIterANextOutput> for IterANextOutput<T, U>
+where
+    T: IntoPy<PyObject>,
+    U: IntoPy<PyObject>,
+{
+    fn convert(self, py: Python) -> PyResult<PyIterANextOutput> {
+        match self {
+            IterANextOutput::Yield(o) => Ok(IterANextOutput::Yield(o.into_py(py))),
+            IterANextOutput::Return(o) => Ok(IterANextOutput::Return(o.into_py(py))),
         }
     }
 }
 
-trait PyAsyncAenterProtocolImpl {
-    fn __aenter__() -> Option<PyMethodDef> {
-        None
+impl<T> IntoPyCallbackOutput<PyIterANextOutput> for Option<T>
+where
+    T: IntoPy<PyObject>,
+{
+    fn convert(self, py: Python) -> PyResult<PyIterANextOutput> {
+        match self {
+            Some(o) => Ok(PyIterANextOutput::Yield(o.into_py(py))),
+            None => Ok(PyIterANextOutput::Return(py.None())),
+        }
     }
 }
-
-impl<'p, T> PyAsyncAenterProtocolImpl for T where T: PyAsyncProtocol<'p> {}
-
-trait PyAsyncAexitProtocolImpl {
-    fn __aexit__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyAsyncAexitProtocolImpl for T where T: PyAsyncProtocol<'p> {}

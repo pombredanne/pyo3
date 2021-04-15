@@ -3,48 +3,68 @@
 //! Python GC support
 //!
 
+use crate::{ffi, AsPyPointer, PyCell, PyClass, Python};
 use std::os::raw::{c_int, c_void};
-
-use crate::ffi;
-use crate::python::{Python, ToPyPointer};
-use crate::typeob::PyTypeInfo;
 
 #[repr(transparent)]
 pub struct PyTraverseError(c_int);
 
 /// GC support
-#[allow(unused_variables)]
-pub trait PyGCProtocol<'p>: PyTypeInfo {
-    fn __traverse__(&'p self, visit: PyVisit) -> Result<(), PyTraverseError> {
-        unimplemented!()
-    }
-
-    fn __clear__(&'p mut self) {
-        unimplemented!()
-    }
+#[allow(clippy::upper_case_acronyms)]
+pub trait PyGCProtocol<'p>: PyClass {
+    fn __traverse__(&'p self, visit: PyVisit) -> Result<(), PyTraverseError>;
+    fn __clear__(&'p mut self);
 }
 
+#[allow(clippy::upper_case_acronyms)]
 pub trait PyGCTraverseProtocol<'p>: PyGCProtocol<'p> {}
+
+#[allow(clippy::upper_case_acronyms)]
 pub trait PyGCClearProtocol<'p>: PyGCProtocol<'p> {}
 
 #[doc(hidden)]
-pub trait PyGCProtocolImpl {
-    fn update_type_object(_type_object: &mut ffi::PyTypeObject) {}
-}
-
-impl<'p, T> PyGCProtocolImpl for T {}
-
-impl<'p, T> PyGCProtocolImpl for T
+pub unsafe extern "C" fn traverse<T>(
+    slf: *mut ffi::PyObject,
+    visit: ffi::visitproc,
+    arg: *mut c_void,
+) -> c_int
 where
-    T: PyGCProtocol<'p>,
+    T: for<'p> PyGCTraverseProtocol<'p>,
 {
-    fn update_type_object(type_object: &mut ffi::PyTypeObject) {
-        type_object.tp_traverse = Self::tp_traverse();
-        type_object.tp_clear = Self::tp_clear();
+    let pool = crate::GILPool::new();
+    let py = pool.python();
+    let slf = py.from_borrowed_ptr::<PyCell<T>>(slf);
+
+    let visit = PyVisit {
+        visit,
+        arg,
+        _py: py,
+    };
+    let borrow = slf.try_borrow();
+    if let Ok(borrow) = borrow {
+        match borrow.__traverse__(visit) {
+            Ok(()) => 0,
+            Err(PyTraverseError(code)) => code,
+        }
+    } else {
+        0
     }
 }
 
-#[derive(Copy, Clone)]
+#[doc(hidden)]
+pub unsafe extern "C" fn clear<T>(slf: *mut ffi::PyObject) -> c_int
+where
+    T: for<'p> PyGCClearProtocol<'p>,
+{
+    let pool = crate::GILPool::new();
+    let slf = pool.python().from_borrowed_ptr::<PyCell<T>>(slf);
+
+    slf.borrow_mut().__clear__();
+    0
+}
+
+/// Object visitor for GC.
+#[derive(Clone)]
 pub struct PyVisit<'p> {
     visit: ffi::visitproc,
     arg: *mut c_void,
@@ -55,9 +75,10 @@ pub struct PyVisit<'p> {
 }
 
 impl<'p> PyVisit<'p> {
+    /// Visit `obj`.
     pub fn call<T>(&self, obj: &T) -> Result<(), PyTraverseError>
     where
-        T: ToPyPointer,
+        T: AsPyPointer,
     {
         let r = unsafe { (self.visit)(obj.as_ptr(), self.arg) };
         if r == 0 {
@@ -65,76 +86,5 @@ impl<'p> PyVisit<'p> {
         } else {
             Err(PyTraverseError(r))
         }
-    }
-}
-
-trait PyGCTraverseProtocolImpl {
-    fn tp_traverse() -> Option<ffi::traverseproc> {
-        None
-    }
-}
-
-impl<'p, T> PyGCTraverseProtocolImpl for T where T: PyGCProtocol<'p> {}
-
-#[doc(hidden)]
-impl<T> PyGCTraverseProtocolImpl for T
-where
-    T: for<'p> PyGCTraverseProtocol<'p>,
-{
-    #[inline]
-    fn tp_traverse() -> Option<ffi::traverseproc> {
-        unsafe extern "C" fn tp_traverse<T>(
-            slf: *mut ffi::PyObject,
-            visit: ffi::visitproc,
-            arg: *mut c_void,
-        ) -> c_int
-        where
-            T: for<'p> PyGCTraverseProtocol<'p>,
-        {
-            let _pool = crate::GILPool::new();
-            let py = Python::assume_gil_acquired();
-            let slf = py.mut_from_borrowed_ptr::<T>(slf);
-
-            let visit = PyVisit {
-                visit,
-                arg,
-                _py: py,
-            };
-            match slf.__traverse__(visit) {
-                Ok(()) => 0,
-                Err(PyTraverseError(code)) => code,
-            }
-        }
-
-        Some(tp_traverse::<T>)
-    }
-}
-
-trait PyGCClearProtocolImpl {
-    fn tp_clear() -> Option<ffi::inquiry> {
-        None
-    }
-}
-
-impl<'p, T> PyGCClearProtocolImpl for T where T: PyGCProtocol<'p> {}
-
-impl<T> PyGCClearProtocolImpl for T
-where
-    T: for<'p> PyGCClearProtocol<'p>,
-{
-    #[inline]
-    fn tp_clear() -> Option<ffi::inquiry> {
-        unsafe extern "C" fn tp_clear<T>(slf: *mut ffi::PyObject) -> c_int
-        where
-            T: for<'p> PyGCClearProtocol<'p>,
-        {
-            let _pool = crate::GILPool::new();
-            let py = Python::assume_gil_acquired();
-            let slf = py.mut_from_borrowed_ptr::<T>(slf);
-
-            slf.__clear__();
-            0
-        }
-        Some(tp_clear::<T>)
     }
 }

@@ -1,25 +1,23 @@
 // Copyright (c) 2017-present PyO3 Project and Contributors
 
-use crate::ffi;
-use libc::c_int;
-use std::ffi::CString;
+use crate::internal_tricks::{extract_cstr_or_leak_cstring, NulByteInString};
+use crate::{ffi, PyObject, Python};
+use std::ffi::CStr;
+use std::fmt;
+use std::os::raw::c_int;
 
-/// `PyMethodDefType` represents different types of python callable objects.
-/// It is used by `#[pymethods]` and `#[pyproto]` annotations.
+/// `PyMethodDefType` represents different types of Python callable objects.
+/// It is used by the `#[pymethods]` and `#[pyproto]` annotations.
 #[derive(Debug)]
 pub enum PyMethodDefType {
-    /// Represents class `__new__` method
-    New(PyMethodDef),
-    /// Represents class `__init__` method
-    Init(PyMethodDef),
-    /// Represents class `__call__` method
-    Call(PyMethodDef),
     /// Represents class method
     Class(PyMethodDef),
     /// Represents static method
     Static(PyMethodDef),
     /// Represents normal method
     Method(PyMethodDef),
+    /// Represents class attribute, used by `#[attribute]`
+    ClassAttribute(PyClassAttributeDef),
     /// Represents getter descriptor, used by `#[getter]`
     Getter(PyGetterDef),
     /// Represents setter descriptor, used by `#[setter]`
@@ -28,125 +26,171 @@ pub enum PyMethodDefType {
 
 #[derive(Copy, Clone, Debug)]
 pub enum PyMethodType {
-    PyCFunction(ffi::PyCFunction),
-    PyCFunctionWithKeywords(ffi::PyCFunctionWithKeywords),
-    PyNoArgsFunction(ffi::PyNoArgsFunction),
-    PyNewFunc(ffi::newfunc),
-    PyInitFunc(ffi::initproc),
+    PyCFunction(PyCFunction),
+    PyCFunctionWithKeywords(PyCFunctionWithKeywords),
 }
 
-#[derive(Copy, Clone, Debug)]
+// These newtype structs serve no purpose other than wrapping which are function pointers - because
+// function pointers aren't allowed in const fn, but types wrapping them are!
+#[derive(Clone, Copy, Debug)]
+pub struct PyCFunction(pub ffi::PyCFunction);
+#[derive(Clone, Copy, Debug)]
+pub struct PyCFunctionWithKeywords(pub ffi::PyCFunctionWithKeywords);
+#[derive(Clone, Copy, Debug)]
+pub struct PyGetter(pub ffi::getter);
+#[derive(Clone, Copy, Debug)]
+pub struct PySetter(pub ffi::setter);
+#[derive(Clone, Copy)]
+pub struct PyClassAttributeFactory(pub for<'p> fn(Python<'p>) -> PyObject);
+
+// TODO: it would be nice to use CStr in these types, but then the constructors can't be const fn
+// until `CStr::from_bytes_with_nul_unchecked` is const fn.
+
+#[derive(Clone, Debug)]
 pub struct PyMethodDef {
-    pub ml_name: &'static str,
-    pub ml_meth: PyMethodType,
-    pub ml_flags: c_int,
-    pub ml_doc: &'static str,
+    pub(crate) ml_name: &'static str,
+    pub(crate) ml_meth: PyMethodType,
+    pub(crate) ml_flags: c_int,
+    pub(crate) ml_doc: &'static str,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone)]
+pub struct PyClassAttributeDef {
+    pub(crate) name: &'static str,
+    pub(crate) meth: PyClassAttributeFactory,
+}
+
+#[derive(Clone, Debug)]
 pub struct PyGetterDef {
-    pub name: &'static str,
-    pub meth: ffi::getter,
-    pub doc: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) meth: PyGetter,
+    doc: &'static str,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct PySetterDef {
-    pub name: &'static str,
-    pub meth: ffi::setter,
-    pub doc: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) meth: PySetter,
+    doc: &'static str,
 }
 
 unsafe impl Sync for PyMethodDef {}
-
-unsafe impl Sync for ffi::PyMethodDef {}
 
 unsafe impl Sync for PyGetterDef {}
 
 unsafe impl Sync for PySetterDef {}
 
-unsafe impl Sync for ffi::PyGetSetDef {}
-
 impl PyMethodDef {
+    /// Define a function with no `*args` and `**kwargs`.
+    pub const fn noargs(name: &'static str, cfunction: PyCFunction, doc: &'static str) -> Self {
+        Self {
+            ml_name: name,
+            ml_meth: PyMethodType::PyCFunction(cfunction),
+            ml_flags: ffi::METH_NOARGS,
+            ml_doc: doc,
+        }
+    }
+
+    /// Define a function that can take `*args` and `**kwargs`.
+    pub const fn cfunction_with_keywords(
+        name: &'static str,
+        cfunction: PyCFunctionWithKeywords,
+        doc: &'static str,
+    ) -> Self {
+        Self {
+            ml_name: name,
+            ml_meth: PyMethodType::PyCFunctionWithKeywords(cfunction),
+            ml_flags: ffi::METH_VARARGS | ffi::METH_KEYWORDS,
+            ml_doc: doc,
+        }
+    }
+
+    pub const fn flags(mut self, flags: c_int) -> Self {
+        self.ml_flags |= flags;
+        self
+    }
+
     /// Convert `PyMethodDef` to Python method definition struct `ffi::PyMethodDef`
-    pub fn as_method_def(&self) -> ffi::PyMethodDef {
+    pub(crate) fn as_method_def(&self) -> Result<ffi::PyMethodDef, NulByteInString> {
         let meth = match self.ml_meth {
-            PyMethodType::PyCFunction(meth) => meth,
-            PyMethodType::PyCFunctionWithKeywords(meth) => unsafe { std::mem::transmute(meth) },
-            PyMethodType::PyNoArgsFunction(meth) => unsafe { std::mem::transmute(meth) },
-            PyMethodType::PyNewFunc(meth) => unsafe { std::mem::transmute(meth) },
-            PyMethodType::PyInitFunc(meth) => unsafe { std::mem::transmute(meth) },
+            PyMethodType::PyCFunction(meth) => meth.0,
+            PyMethodType::PyCFunctionWithKeywords(meth) => unsafe { std::mem::transmute(meth.0) },
         };
 
-        ffi::PyMethodDef {
-            ml_name: CString::new(self.ml_name)
-                .expect("Method name must not contain NULL byte")
-                .into_raw(),
+        Ok(ffi::PyMethodDef {
+            ml_name: get_name(self.ml_name)?.as_ptr(),
             ml_meth: Some(meth),
             ml_flags: self.ml_flags,
-            ml_doc: self.ml_doc.as_ptr() as *const _,
-        }
+            ml_doc: get_doc(self.ml_doc)?.as_ptr(),
+        })
+    }
+}
+
+impl PyClassAttributeDef {
+    /// Define a class attribute.
+    pub const fn new(name: &'static str, meth: PyClassAttributeFactory) -> Self {
+        Self { name, meth }
+    }
+}
+
+// Manual implementation because `Python<'_>` does not implement `Debug` and
+// trait bounds on `fn` compiler-generated derive impls are too restrictive.
+impl fmt::Debug for PyClassAttributeDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PyClassAttributeDef")
+            .field("name", &self.name)
+            .finish()
     }
 }
 
 impl PyGetterDef {
+    /// Define a getter.
+    pub const fn new(name: &'static str, getter: PyGetter, doc: &'static str) -> Self {
+        Self {
+            name,
+            meth: getter,
+            doc,
+        }
+    }
+
     /// Copy descriptor information to `ffi::PyGetSetDef`
     pub fn copy_to(&self, dst: &mut ffi::PyGetSetDef) {
         if dst.name.is_null() {
-            dst.name = CString::new(self.name)
-                .expect("Method name must not contain NULL byte")
-                .into_raw();
+            dst.name = get_name(self.name).unwrap().as_ptr() as _;
         }
-        dst.get = Some(self.meth);
+        if dst.doc.is_null() {
+            dst.doc = get_doc(self.doc).unwrap().as_ptr() as _;
+        }
+        dst.get = Some(self.meth.0);
     }
 }
 
 impl PySetterDef {
+    /// Define a setter.
+    pub const fn new(name: &'static str, setter: PySetter, doc: &'static str) -> Self {
+        Self {
+            name,
+            meth: setter,
+            doc,
+        }
+    }
+
     /// Copy descriptor information to `ffi::PyGetSetDef`
     pub fn copy_to(&self, dst: &mut ffi::PyGetSetDef) {
         if dst.name.is_null() {
-            dst.name = CString::new(self.name)
-                .expect("Method name must not contain NULL byte")
-                .into_raw();
+            dst.name = get_name(self.name).unwrap().as_ptr() as _;
         }
-        dst.set = Some(self.meth);
+        if dst.doc.is_null() {
+            dst.doc = get_doc(self.doc).unwrap().as_ptr() as _;
+        }
+        dst.set = Some(self.meth.0);
     }
 }
 
-#[doc(hidden)] // Only to be used through the proc macros, use PyMethodsProtocol in custom code
-/// This trait is implemented for all pyclass so to implement the [PyMethodsProtocol]
-/// through inventory
-pub trait PyMethodsInventoryDispatch {
-    /// This allows us to get the inventory type when only the pyclass is in scope
-    type InventoryType: PyMethodsInventory;
+fn get_name(name: &'static str) -> Result<&'static CStr, NulByteInString> {
+    extract_cstr_or_leak_cstring(name, "Function name cannot contain NUL byte.")
 }
 
-#[doc(hidden)] // Only to be used through the proc macros, use PyMethodsProtocol in custom code
-/// Allows arbitrary pymethod blocks to submit their methods, which are eventually collected by pyclass
-pub trait PyMethodsInventory: inventory::Collect {
-    /// Create a new instance
-    fn new(methods: &'static [PyMethodDefType]) -> Self;
-
-    /// Returns the methods for a single impl block
-    fn get_methods(&self) -> &'static [PyMethodDefType];
-}
-
-/// The implementation of tis trait defines which methods a python type has.
-///
-/// For pyclass derived structs this is implemented by collecting all impl blocks through inventory
-pub trait PyMethodsProtocol {
-    /// Returns all methods that are defined for a class
-    fn py_methods() -> Vec<&'static PyMethodDefType>;
-}
-
-impl<T> PyMethodsProtocol for T
-where
-    T: PyMethodsInventoryDispatch,
-{
-    fn py_methods() -> Vec<&'static PyMethodDefType> {
-        inventory::iter::<T::InventoryType>
-            .into_iter()
-            .flat_map(PyMethodsInventory::get_methods)
-            .collect()
-    }
+fn get_doc(doc: &'static str) -> Result<&'static CStr, NulByteInString> {
+    extract_cstr_or_leak_cstring(doc, "Document cannot contain NUL byte.")
 }

@@ -6,39 +6,33 @@
 mod macros;
 
 pub mod basic;
+#[cfg(not(Py_LIMITED_API))]
 pub mod buffer;
 pub mod context;
 pub mod descr;
 pub mod gc;
+#[doc(hidden)]
+pub mod impl_;
 pub mod iter;
 pub mod mapping;
+#[doc(hidden)]
 pub mod methods;
 pub mod number;
 pub mod pyasync;
 pub mod sequence;
 
 pub use self::basic::PyObjectProtocol;
+#[cfg(not(Py_LIMITED_API))]
 pub use self::buffer::PyBufferProtocol;
 pub use self::context::PyContextProtocol;
 pub use self::descr::PyDescrProtocol;
+pub use self::gc::{PyGCProtocol, PyTraverseError, PyVisit};
 pub use self::iter::PyIterProtocol;
 pub use self::mapping::PyMappingProtocol;
+#[doc(hidden)]
+pub use self::methods::{
+    PyClassAttributeDef, PyGetterDef, PyMethodDef, PyMethodDefType, PyMethodType, PySetterDef,
+};
 pub use self::number::PyNumberProtocol;
 pub use self::pyasync::PyAsyncProtocol;
 pub use self::sequence::PySequenceProtocol;
-
-pub use self::gc::{PyGCProtocol, PyTraverseError, PyVisit};
-pub use self::methods::{PyGetterDef, PyMethodDef, PyMethodDefType, PyMethodType, PySetterDef};
-
-use crate::ffi;
-
-/// Operators for the __richcmp__ method
-#[derive(Debug)]
-pub enum CompareOp {
-    Lt = ffi::Py_LT as isize,
-    Le = ffi::Py_LE as isize,
-    Eq = ffi::Py_EQ as isize,
-    Ne = ffi::Py_NE as isize,
-    Gt = ffi::Py_GT as isize,
-    Ge = ffi::Py_GE as isize,
-}

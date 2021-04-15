@@ -1,49 +1,193 @@
-use regex::Regex;
-use std::collections::HashMap;
-use std::convert::AsRef;
-use std::env;
-use std::fmt;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
-use std::process::Command;
-use std::process::Stdio;
-use version_check::{is_min_date, is_min_version, supports_features};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::AsRef,
+    env,
+    fs::{self, DirEntry},
+    io,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    str::FromStr,
+};
 
-/// Specifies the minimum nightly version needed to compile pyo3.
-/// Keep this synced up with the travis ci config,
-/// But note that this is the rustc version which can be lower than the nightly version
-const MIN_DATE: &'static str = "2019-02-06";
-const MIN_VERSION: &'static str = "1.34.0-nightly";
+/// Minimum required Python version.
+const PY3_MIN_MINOR: u8 = 6;
+/// Maximum Python version that can be used as minimum required Python version with abi3.
+const ABI3_MAX_MINOR: u8 = 9;
+const CFG_KEY: &str = "py_sys_config";
 
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+// A simple macro for returning an error. Resembles anyhow::bail.
+macro_rules! bail {
+    ($msg: expr) => { return Err($msg.into()); };
+    ($fmt: literal $($args: tt)+) => { return Err(format!($fmt $($args)+).into()); };
+}
+
+// A simple macro for checking a condition. Resembles anyhow::ensure.
+macro_rules! ensure {
+    ($condition:expr, $($args: tt)+) => { if !($condition) { bail!($($args)+) } };
+}
+
+// Show warning. If needed, please extend this macro to support arguments.
+macro_rules! warn {
+    ($msg: literal) => {
+        println!(concat!("cargo:warning=", $msg));
+    };
+}
+
+/// Information returned from python interpreter
 #[derive(Debug)]
+struct InterpreterConfig {
+    version: PythonVersion,
+    libdir: Option<String>,
+    shared: bool,
+    ld_version: String,
+    /// Prefix used for determining the directory of libpython
+    base_prefix: String,
+    executable: PathBuf,
+    calcsize_pointer: Option<u32>,
+    implementation: PythonInterpreterKind,
+}
+
+impl InterpreterConfig {
+    fn is_pypy(&self) -> bool {
+        self.implementation == PythonInterpreterKind::PyPy
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 struct PythonVersion {
     major: u8,
-    // minor == None means any minor version will do
-    minor: Option<u8>,
+    minor: u8,
 }
 
-impl PartialEq for PythonVersion {
-    fn eq(&self, o: &PythonVersion) -> bool {
-        self.major == o.major && (self.minor.is_none() || self.minor == o.minor)
+impl PythonVersion {
+    const PY37: Self = PythonVersion { major: 3, minor: 7 };
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PythonInterpreterKind {
+    CPython,
+    PyPy,
+}
+
+impl FromStr for PythonInterpreterKind {
+    type Err = Box<dyn std::error::Error>;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "CPython" => Ok(PythonInterpreterKind::CPython),
+            "PyPy" => Ok(PythonInterpreterKind::PyPy),
+            _ => bail!("Invalid interpreter: {}", s),
+        }
     }
 }
 
-impl fmt::Display for PythonVersion {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        self.major.fmt(f)?;
-        f.write_str(".")?;
-        match self.minor {
-            Some(minor) => minor.fmt(f)?,
-            None => f.write_str("*")?,
+fn is_abi3() -> bool {
+    env::var_os("CARGO_FEATURE_ABI3").is_some()
+}
+
+trait GetPrimitive {
+    fn get_bool(&self, key: &str) -> Result<bool>;
+    fn get_numeric<T: FromStr>(&self, key: &str) -> Result<T>;
+}
+
+impl GetPrimitive for HashMap<String, String> {
+    fn get_bool(&self, key: &str) -> Result<bool> {
+        match self
+            .get(key)
+            .map(|x| x.as_str())
+            .ok_or(format!("{} is not defined", key))?
+        {
+            "1" | "true" | "True" => Ok(true),
+            "0" | "false" | "False" => Ok(false),
+            _ => bail!("{} must be a bool (1/true/True or 0/false/False", key),
+        }
+    }
+
+    fn get_numeric<T: FromStr>(&self, key: &str) -> Result<T> {
+        self.get(key)
+            .ok_or(format!("{} is not defined", key))?
+            .parse::<T>()
+            .map_err(|_| format!("Could not parse value of {}", key).into())
+    }
+}
+
+struct CrossCompileConfig {
+    lib_dir: PathBuf,
+    version: Option<String>,
+    os: String,
+    arch: String,
+}
+
+impl CrossCompileConfig {
+    fn new() -> Result<Self> {
+        Ok(CrossCompileConfig {
+            lib_dir: CrossCompileConfig::validate_variable("PYO3_CROSS_LIB_DIR")?,
+            os: env::var("CARGO_CFG_TARGET_OS").unwrap(),
+            arch: env::var("CARGO_CFG_TARGET_ARCH").unwrap(),
+            version: env::var_os("PYO3_CROSS_PYTHON_VERSION").map(|s| s.into_string().unwrap()),
+        })
+    }
+
+    fn validate_variable(var: &str) -> Result<PathBuf> {
+        let path = match env::var_os(var) {
+            Some(v) => v,
+            None => bail!(
+                "Must provide {} environment variable when cross-compiling",
+                var
+            ),
         };
-        Ok(())
+
+        if fs::metadata(&path).is_err() {
+            bail!("{} value of {:?} does not exist", var, path)
+        }
+
+        Ok(path.into())
     }
 }
 
-const PY3_MIN_MINOR: u8 = 5;
+fn cross_compiling() -> Result<Option<CrossCompileConfig>> {
+    if env::var_os("PYO3_CROSS").is_none()
+        && env::var_os("PYO3_CROSS_LIB_DIR").is_none()
+        && env::var_os("PYO3_CROSS_PYTHON_VERSION").is_none()
+    {
+        let target = env::var("TARGET")?;
+        let host = env::var("HOST")?;
+        if target == host {
+            // Not cross-compiling
+            return Ok(None);
+        }
 
-const CFG_KEY: &'static str = "py_sys_config";
+        if target == "i686-pc-windows-msvc" && host == "x86_64-pc-windows-msvc" {
+            // Not cross-compiling to compile for 32-bit Python from windows 64-bit
+            return Ok(None);
+        }
+
+        if target == "x86_64-apple-darwin" && host == "aarch64-apple-darwin" {
+            // Not cross-compiling to compile for x86-64 Python from macOS arm64
+            return Ok(None);
+        }
+
+        if target == "aarch64-apple-darwin" && host == "x86_64-apple-darwin" {
+            // Not cross-compiling to compile for arm64 Python from macOS x86_64
+            return Ok(None);
+        }
+
+        if host.starts_with(&format!(
+            "{}-{}-{}",
+            env::var("CARGO_CFG_TARGET_ARCH")?,
+            env::var("CARGO_CFG_TARGET_VENDOR")?,
+            env::var("CARGO_CFG_TARGET_OS")?
+        )) {
+            // Not cross-compiling if arch-vendor-os is all the same
+            // e.g. x86_64-unknown-linux-musl on x86_64-unknown-linux-gnu host
+            return Ok(None);
+        }
+    }
+
+    // Cross-compiling on any other platform
+    Ok(Some(CrossCompileConfig::new()?))
+}
 
 /// A list of python interpreter compile-time preprocessor defines that
 /// we will pick up and pass to rustc via --cfg=py_sys_config={varname};
@@ -57,498 +201,700 @@ const CFG_KEY: &'static str = "py_sys_config";
 ///
 /// (hrm, this is sort of re-implementing what distutils does, except
 /// by passing command line args instead of referring to a python.h)
-#[cfg(not(target_os = "windows"))]
-static SYSCONFIG_FLAGS: [&'static str; 7] = [
-    "Py_USING_UNICODE",
-    "Py_UNICODE_WIDE",
+struct BuildFlags(HashSet<&'static str>);
+
+impl BuildFlags {
+    const ALL: [&'static str; 5] = [
+        "WITH_THREAD",
+        "Py_DEBUG",
+        "Py_REF_DEBUG",
+        "Py_TRACE_REFS",
+        "COUNT_ALLOCS",
+    ];
+
+    fn from_config_map(config_map: &HashMap<String, String>) -> Self {
+        Self(
+            BuildFlags::ALL
+                .iter()
+                .copied()
+                .filter(|flag| config_map.get(*flag).map_or(false, |value| value == "1"))
+                .collect(),
+        )
+    }
+
+    /// Examine python's compile flags to pass to cfg by launching
+    /// the interpreter and printing variables of interest from
+    /// sysconfig.get_config_vars.
+    fn from_interpreter(python_path: &Path) -> Result<Self> {
+        if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+            return Ok(Self::windows_hardcoded());
+        }
+
+        let mut script = "import sysconfig; \
+                        config = sysconfig.get_config_vars();"
+            .to_owned();
+
+        for k in BuildFlags::ALL.iter() {
+            script.push_str(&format!("print(config.get('{}', '0'));", k));
+        }
+
+        let stdout = run_python_script(python_path, &script)?;
+        let split_stdout: Vec<&str> = stdout.trim_end().lines().collect();
+        if split_stdout.len() != BuildFlags::ALL.len() {
+            bail!(
+                "Python stdout len didn't return expected number of lines: {}",
+                split_stdout.len()
+            );
+        }
+        let flags = BuildFlags::ALL
+            .iter()
+            .zip(split_stdout)
+            .filter(|(_, flag_value)| *flag_value == "1")
+            .map(|(&flag, _)| flag)
+            .collect();
+
+        Ok(Self(flags))
+    }
+
+    fn windows_hardcoded() -> Self {
+        // sysconfig is missing all the flags on windows, so we can't actually
+        // query the interpreter directly for its build flags.
+        //
+        // For the time being, this is the flags as defined in the python source's
+        // PC\pyconfig.h. This won't work correctly if someone has built their
+        // python with a modified pyconfig.h - sorry if that is you, you will have
+        // to comment/uncomment the lines below.
+        let mut flags = HashSet::new();
+        flags.insert("WITH_THREAD");
+
+        // This is defined #ifdef _DEBUG. The visual studio build seems to produce
+        // a specially named pythonXX_d.exe and pythonXX_d.dll when you build the
+        // Debug configuration, which this script doesn't currently support anyway.
+        // map.insert("Py_DEBUG", "1");
+
+        // Uncomment these manually if your python was built with these and you want
+        // the cfg flags to be set in rust.
+        //
+        // map.insert("Py_REF_DEBUG", "1");
+        // map.insert("Py_TRACE_REFS", "1");
+        // map.insert("COUNT_ALLOCS", 1");
+        Self(flags)
+    }
+
+    fn fixup(&mut self, interpreter_config: &InterpreterConfig) {
+        if self.0.contains("Py_DEBUG") {
+            self.0.insert("Py_REF_DEBUG");
+            if interpreter_config.version <= PythonVersion::PY37 {
+                // Py_DEBUG only implies Py_TRACE_REFS until Python 3.7
+                self.0.insert("Py_TRACE_REFS");
+            }
+        }
+
+        // WITH_THREAD is always on for Python 3.7, and for PyPy.
+        if interpreter_config.is_pypy() || interpreter_config.version >= PythonVersion::PY37 {
+            self.0.insert("WITH_THREAD");
+        }
+    }
+}
+
+fn parse_script_output(output: &str) -> HashMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut i = line.splitn(2, ' ');
+            Some((i.next()?.into(), i.next()?.into()))
+        })
+        .collect()
+}
+
+/// Parse sysconfigdata file
+///
+/// The sysconfigdata is simply a dictionary containing all the build time variables used for the
+/// python executable and library. Here it is read and added to a script to extract only what is
+/// necessary. This necessitates a python interpreter for the host machine to work.
+fn parse_sysconfigdata(config_path: impl AsRef<Path>) -> Result<HashMap<String, String>> {
+    let mut script = fs::read_to_string(config_path)?;
+    script += r#"
+print("version_major", build_time_vars["VERSION"][0])  # 3
+print("version_minor", build_time_vars["VERSION"][2])  # E.g., 8
+KEYS = [
     "WITH_THREAD",
     "Py_DEBUG",
     "Py_REF_DEBUG",
     "Py_TRACE_REFS",
     "COUNT_ALLOCS",
-];
+    "Py_ENABLE_SHARED",
+    "LDVERSION",
+    "SIZEOF_VOID_P"
+]
+for key in KEYS:
+    print(key, build_time_vars.get(key, 0))
+"#;
+    let output = run_python_script(&find_interpreter()?, &script)?;
 
-static SYSCONFIG_VALUES: [&'static str; 1] = [
-    // cfg doesn't support flags with values, just bools - so flags
-    // below are translated into bools as {varname}_{val}
-    //
-    // for example, Py_UNICODE_SIZE_2 or Py_UNICODE_SIZE_4
-    "Py_UNICODE_SIZE", // note - not present on python 3.3+, which is always wide
-];
+    Ok(parse_script_output(&output))
+}
 
-/// Attempts to parse the header at the given path, returning a map of definitions to their values.
-/// Each entry in the map directly corresponds to a `#define` in the given header.
-fn parse_header_defines<P: AsRef<Path>>(header_path: P) -> Result<HashMap<String, String>, String> {
-    // This regex picks apart a C style, single line `#define` statement into an identifier and a
-    // value. e.g. for the line `#define Py_DEBUG 1`, this regex will capture `Py_DEBUG` into
-    // `ident` and `1` into `value`.
-    let define_regex =
-        Regex::new(r"^\s*#define\s+(?P<ident>[a-zA-Z0-9_]+)\s+(?P<value>.+)\s*$").unwrap();
+fn starts_with(entry: &DirEntry, pat: &str) -> bool {
+    let name = entry.file_name();
+    name.to_string_lossy().starts_with(pat)
+}
+fn ends_with(entry: &DirEntry, pat: &str) -> bool {
+    let name = entry.file_name();
+    name.to_string_lossy().ends_with(pat)
+}
 
-    let header_file = File::open(header_path.as_ref()).map_err(|e| e.to_string())?;
-    let header_reader = BufReader::new(&header_file);
-
-    let definitions = header_reader
-        .lines()
-        .filter_map(|maybe_line| {
-            let line = maybe_line.unwrap_or_else(|err| {
-                panic!("failed to read {}: {}", header_path.as_ref().display(), err);
-            });
-            let captures = define_regex.captures(&line)?;
-
-            if captures.name("ident").is_some() && captures.name("value").is_some() {
-                Some((
-                    captures.name("ident").unwrap().as_str().to_owned(),
-                    captures.name("value").unwrap().as_str().to_owned(),
-                ))
-            } else {
-                None
+/// Finds the `_sysconfigdata*.py` file in the library path.
+///
+/// From the python source for `_sysconfigdata*.py` is always going to be located at
+/// `build/lib.{PLATFORM}-{PY_MINOR_VERSION}` when built from source. The [exact line][1] is defined as:
+///
+/// ```py
+/// pybuilddir = 'build/lib.%s-%s' % (get_platform(), sys.version_info[:2])
+/// ```
+///
+/// Where get_platform returns a kebab-case formated string containing the os, the architecture and
+/// possibly the os' kernel version (not the case on linux). However, when installed using a package
+/// manager, the `_sysconfigdata*.py` file is installed in the `${PREFIX}/lib/python3.Y/` directory.
+/// The `_sysconfigdata*.py` is generally in a sub-directory of the location of `libpython3.Y.so`.
+/// So we must find the file in the following possible locations:
+///
+/// ```sh
+/// # distribution from package manager, lib_dir should include lib/
+/// ${INSTALL_PREFIX}/lib/python3.Y/_sysconfigdata*.py
+/// ${INSTALL_PREFIX}/lib/libpython3.Y.so
+/// ${INSTALL_PREFIX}/lib/python3.Y/config-3.Y-${HOST_TRIPLE}/libpython3.Y.so
+///
+/// # Built from source from host
+/// ${CROSS_COMPILED_LOCATION}/build/lib.linux-x86_64-Y/_sysconfigdata*.py
+/// ${CROSS_COMPILED_LOCATION}/libpython3.Y.so
+///
+/// # if cross compiled, kernel release is only present on certain OS targets.
+/// ${CROSS_COMPILED_LOCATION}/build/lib.{OS}(-{OS-KERNEL-RELEASE})?-{ARCH}-Y/_sysconfigdata*.py
+/// ${CROSS_COMPILED_LOCATION}/libpython3.Y.so
+/// ```
+///
+/// [1]: https://github.com/python/cpython/blob/3.5/Lib/sysconfig.py#L389
+fn find_sysconfigdata(cross: &CrossCompileConfig) -> Result<PathBuf> {
+    let sysconfig_paths = search_lib_dir(&cross.lib_dir, &cross);
+    let sysconfig_name = env::var_os("_PYTHON_SYSCONFIGDATA_NAME");
+    let mut sysconfig_paths = sysconfig_paths
+        .iter()
+        .filter_map(|p| {
+            let canonical = fs::canonicalize(p).ok();
+            match &sysconfig_name {
+                Some(_) => canonical.filter(|p| p.file_stem() == sysconfig_name.as_deref()),
+                None => canonical,
             }
         })
-        .collect();
-
-    Ok(definitions)
-}
-
-fn fix_config_map(mut config_map: HashMap<String, String>) -> HashMap<String, String> {
-    if let Some("1") = config_map.get("Py_DEBUG").as_ref().map(|s| s.as_str()) {
-        config_map.insert("Py_REF_DEBUG".to_owned(), "1".to_owned());
-        config_map.insert("Py_TRACE_REFS".to_owned(), "1".to_owned());
-        config_map.insert("COUNT_ALLOCS".to_owned(), "1".to_owned());
+        .collect::<Vec<PathBuf>>();
+    sysconfig_paths.dedup();
+    if sysconfig_paths.is_empty() {
+        bail!(
+            "Could not find either libpython.so or _sysconfigdata*.py in {}",
+            cross.lib_dir.display()
+        );
+    } else if sysconfig_paths.len() > 1 {
+        let mut error_msg = String::from(
+            "Detected multiple possible Python versions. Please set either the \
+            PYO3_CROSS_PYTHON_VERSION variable to the wanted version or the \
+            _PYTHON_SYSCONFIGDATA_NAME variable to the wanted sysconfigdata file name.\n\n\
+            sysconfigdata files found:",
+        );
+        for path in sysconfig_paths {
+            error_msg += &format!("\n\t{}", path.display());
+        }
+        bail!("{}", error_msg);
     }
 
-    config_map
+    Ok(sysconfig_paths.remove(0))
 }
 
-fn load_cross_compile_info() -> Result<(PythonVersion, HashMap<String, String>, Vec<String>), String>
-{
-    let python_include_dir = env::var("PYO3_CROSS_INCLUDE_DIR").unwrap();
-    let python_include_dir = Path::new(&python_include_dir);
+/// recursive search for _sysconfigdata, returns all possibilities of sysconfigdata paths
+fn search_lib_dir(path: impl AsRef<Path>, cross: &CrossCompileConfig) -> Vec<PathBuf> {
+    let mut sysconfig_paths = vec![];
+    let version_pat = if let Some(v) = &cross.version {
+        format!("python{}", v)
+    } else {
+        "python3.".into()
+    };
+    for f in fs::read_dir(path).expect("Path does not exist") {
+        let sysc = match &f {
+            Ok(f) if starts_with(f, "_sysconfigdata") && ends_with(f, "py") => vec![f.path()],
+            Ok(f) if starts_with(f, "build") => search_lib_dir(f.path(), cross),
+            Ok(f) if starts_with(f, "lib.") => {
+                let name = f.file_name();
+                // check if right target os
+                if !name.to_string_lossy().contains(if cross.os == "android" {
+                    "linux"
+                } else {
+                    &cross.os
+                }) {
+                    continue;
+                }
+                // Check if right arch
+                if !name.to_string_lossy().contains(&cross.arch) {
+                    continue;
+                }
+                search_lib_dir(f.path(), cross)
+            }
+            Ok(f) if starts_with(f, &version_pat) => search_lib_dir(f.path(), cross),
+            _ => continue,
+        };
+        sysconfig_paths.extend(sysc);
+    }
+    sysconfig_paths
+}
 
-    let patchlevel_defines = parse_header_defines(python_include_dir.join("patchlevel.h"))?;
+/// Find cross compilation information from sysconfigdata file
+///
+/// first find sysconfigdata file which follows the pattern [`_sysconfigdata_{abi}_{platform}_{multiarch}`][1]
+/// on python 3.6 or greater. On python 3.5 it is simply `_sysconfigdata.py`.
+///
+/// [1]: https://github.com/python/cpython/blob/3.8/Lib/sysconfig.py#L348
+fn load_cross_compile_from_sysconfigdata(
+    cross_compile_config: CrossCompileConfig,
+) -> Result<(InterpreterConfig, BuildFlags)> {
+    let sysconfig_path = find_sysconfigdata(&cross_compile_config)?;
+    let sysconfig_data = parse_sysconfigdata(sysconfig_path)?;
 
-    let major = patchlevel_defines
-        .get("PY_MAJOR_VERSION")
-        .and_then(|major| major.parse::<u8>().ok())
-        .expect("PY_MAJOR_VERSION undefined");
+    let major = sysconfig_data.get_numeric("version_major")?;
+    let minor = sysconfig_data.get_numeric("version_minor")?;
+    let ld_version = match sysconfig_data.get("LDVERSION") {
+        Some(s) => s.clone(),
+        None => format!("{}.{}", major, minor),
+    };
+    let calcsize_pointer = sysconfig_data.get_numeric("SIZEOF_VOID_P").ok();
 
-    let minor = patchlevel_defines
-        .get("PY_MINOR_VERSION")
-        .and_then(|minor| minor.parse::<u8>().ok())
-        .expect("PY_MINOR_VERSION undefined");
+    let python_version = PythonVersion { major, minor };
 
-    let python_version = PythonVersion {
-        major,
-        minor: Some(minor),
+    let interpreter_config = InterpreterConfig {
+        version: python_version,
+        libdir: cross_compile_config.lib_dir.to_str().map(String::from),
+        shared: sysconfig_data.get_bool("Py_ENABLE_SHARED")?,
+        ld_version,
+        base_prefix: "".to_string(),
+        executable: PathBuf::new(),
+        calcsize_pointer,
+        implementation: PythonInterpreterKind::CPython,
     };
 
-    let config_map = parse_header_defines(python_include_dir.join("pyconfig.h"))?;
+    let build_flags = BuildFlags::from_config_map(&sysconfig_data);
 
-    let config_lines = vec![
-        "".to_owned(), // compatibility, not used when cross compiling.
-        env::var("PYO3_CROSS_LIB_DIR").unwrap(),
-        config_map
-            .get("Py_ENABLE_SHARED")
-            .expect("Py_ENABLE_SHARED undefined")
-            .to_owned(),
-        format!("{}.{}", major, minor),
-        "".to_owned(), // compatibility, not used when cross compiling.
-    ];
-
-    Ok((python_version, fix_config_map(config_map), config_lines))
+    Ok((interpreter_config, build_flags))
 }
 
-/// Examine python's compile flags to pass to cfg by launching
-/// the interpreter and printing variables of interest from
-/// sysconfig.get_config_vars.
-#[cfg(not(target_os = "windows"))]
-fn get_config_vars(python_path: &str) -> Result<HashMap<String, String>, String> {
-    // FIXME: We can do much better here using serde:
-    // import json, sysconfig; print(json.dumps({k:str(v) for k, v in sysconfig.get_config_vars().items()}))
-
-    let mut script = "import sysconfig; \
-                      config = sysconfig.get_config_vars();"
-        .to_owned();
-
-    for k in SYSCONFIG_FLAGS.iter().chain(SYSCONFIG_VALUES.iter()) {
-        script.push_str(&format!(
-            "print(config.get('{}', {}));",
-            k,
-            if is_value(k) { "None" } else { "0" }
-        ));
-    }
-
-    let stdout = run_python_script(python_path, &script)?;
-    let split_stdout: Vec<&str> = stdout.trim_end().lines().collect();
-    if split_stdout.len() != SYSCONFIG_VALUES.len() + SYSCONFIG_FLAGS.len() {
-        return Err(format!(
-            "python stdout len didn't return expected number of lines: {}",
-            split_stdout.len()
-        ));
-    }
-    let all_vars = SYSCONFIG_FLAGS.iter().chain(SYSCONFIG_VALUES.iter());
-    let all_vars = all_vars.zip(split_stdout.iter()).fold(
-        HashMap::new(),
-        |mut memo: HashMap<String, String>, (&k, &v)| {
-            if !(v.to_owned() == "None" && is_value(k)) {
-                memo.insert(k.to_owned(), v.to_owned());
-            }
-            memo
-        },
-    );
-
-    Ok(fix_config_map(all_vars))
-}
-
-#[cfg(target_os = "windows")]
-fn get_config_vars(_: &str) -> Result<HashMap<String, String>, String> {
-    // sysconfig is missing all the flags on windows, so we can't actually
-    // query the interpreter directly for its build flags.
-    //
-    // For the time being, this is the flags as defined in the python source's
-    // PC\pyconfig.h. This won't work correctly if someone has built their
-    // python with a modified pyconfig.h - sorry if that is you, you will have
-    // to comment/uncomment the lines below.
-    let mut map: HashMap<String, String> = HashMap::new();
-    map.insert("Py_USING_UNICODE".to_owned(), "1".to_owned());
-    map.insert("Py_UNICODE_WIDE".to_owned(), "0".to_owned());
-    map.insert("WITH_THREAD".to_owned(), "1".to_owned());
-    map.insert("Py_UNICODE_SIZE".to_owned(), "2".to_owned());
-
-    // This is defined #ifdef _DEBUG. The visual studio build seems to produce
-    // a specially named pythonXX_d.exe and pythonXX_d.dll when you build the
-    // Debug configuration, which this script doesn't currently support anyway.
-    // map.insert("Py_DEBUG", "1");
-
-    // Uncomment these manually if your python was built with these and you want
-    // the cfg flags to be set in rust.
-    //
-    // map.insert("Py_REF_DEBUG", "1");
-    // map.insert("Py_TRACE_REFS", "1");
-    // map.insert("COUNT_ALLOCS", 1");
-    Ok(map)
-}
-
-fn is_value(key: &str) -> bool {
-    SYSCONFIG_VALUES.iter().find(|x| **x == key).is_some()
-}
-
-fn cfg_line_for_var(key: &str, val: &str) -> Option<String> {
-    if is_value(key) {
-        // is a value; suffix the key name with the value
-        Some(format!("cargo:rustc-cfg={}=\"{}_{}\"\n", CFG_KEY, key, val))
-    } else if val != "0" {
-        // is a flag that isn't zero
-        Some(format!("cargo:rustc-cfg={}=\"{}\"", CFG_KEY, key))
+fn windows_hardcoded_cross_compile(
+    cross_compile_config: CrossCompileConfig,
+) -> Result<(InterpreterConfig, BuildFlags)> {
+    let (major, minor) = if let Some(version) = cross_compile_config.version {
+        let mut parts = version.split('.');
+        match (
+            parts.next().and_then(|major| major.parse().ok()),
+            parts.next().and_then(|minor| minor.parse().ok()),
+            parts.next(),
+        ) {
+            (Some(major), Some(minor), None) => (major, minor),
+            _ => bail!(
+                "Expected major.minor version (e.g. 3.9) for PYO3_CROSS_PYTHON_VERSION, got `{}`",
+                version
+            ),
+        }
+    } else if let Some(minor_version) = get_abi3_minor_version() {
+        (3, minor_version)
     } else {
-        // is a flag that is zero
-        None
+        bail!("PYO3_CROSS_PYTHON_VERSION or an abi3-py3* feature must be specified when cross-compiling for Windows.")
+    };
+
+    let python_version = PythonVersion { major, minor };
+
+    let interpreter_config = InterpreterConfig {
+        version: python_version,
+        libdir: cross_compile_config.lib_dir.to_str().map(String::from),
+        shared: true,
+        ld_version: format!("{}.{}", major, minor),
+        base_prefix: "".to_string(),
+        executable: PathBuf::new(),
+        calcsize_pointer: None,
+        implementation: PythonInterpreterKind::CPython,
+    };
+
+    Ok((interpreter_config, BuildFlags::windows_hardcoded()))
+}
+
+fn load_cross_compile_info(
+    cross_compile_config: CrossCompileConfig,
+) -> Result<(InterpreterConfig, BuildFlags)> {
+    match env::var_os("CARGO_CFG_TARGET_FAMILY") {
+        // Configure for unix platforms using the sysconfigdata file
+        Some(os) if os == "unix" => load_cross_compile_from_sysconfigdata(cross_compile_config),
+        // Use hardcoded interpreter config when targeting Windows
+        Some(os) if os == "windows" => windows_hardcoded_cross_compile(cross_compile_config),
+        // Waiting for users to tell us what they expect on their target platform
+        Some(os) => bail!(
+            "Unsupported target OS family for cross-compilation: {:?}",
+            os
+        ),
+        // Unknown os family - try to do something useful
+        None => load_cross_compile_from_sysconfigdata(cross_compile_config),
     }
 }
 
 /// Run a python script using the specified interpreter binary.
-fn run_python_script(interpreter: &str, script: &str) -> Result<String, String> {
+fn run_python_script(interpreter: &Path, script: &str) -> Result<String> {
     let out = Command::new(interpreter)
-        .args(&["-c", script])
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .output()
-        .map_err(|e| {
-            format!(
-                "Failed to run the python interpreter at {}: {}",
-                interpreter, e
-            )
-        })?;
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .expect("piped stdin")
+                .write_all(script.as_bytes())?;
+            child.wait_with_output()
+        });
 
-    if !out.status.success() {
-        return Err(format!("python script failed"));
-    }
-
-    Ok(String::from_utf8(out.stdout).unwrap())
-}
-
-#[cfg(not(target_os = "macos"))]
-#[cfg(not(target_os = "windows"))]
-fn get_rustc_link_lib(
-    _: &PythonVersion,
-    ld_version: &str,
-    enable_shared: bool,
-) -> Result<String, String> {
-    if enable_shared {
-        Ok(format!("cargo:rustc-link-lib=python{}", ld_version))
-    } else {
-        Ok(format!("cargo:rustc-link-lib=static=python{}", ld_version))
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn get_macos_linkmodel() -> Result<String, String> {
-    let script = r#"
-import sysconfig
-
-if sysconfig.get_config_var("PYTHONFRAMEWORK"):
-    print("framework")
-elif sysconfig.get_config_var("Py_ENABLE_SHARED"):
-    print("shared")
-else:
-    print("static")
-"#;
-    let out = run_python_script("python", script).unwrap();
-    Ok(out.trim_end().to_owned())
-}
-
-#[cfg(target_os = "macos")]
-fn get_rustc_link_lib(_: &PythonVersion, ld_version: &str, _: bool) -> Result<String, String> {
-    // os x can be linked to a framework or static or dynamic, and
-    // Py_ENABLE_SHARED is wrong; framework means shared library
-    match get_macos_linkmodel().unwrap().as_ref() {
-        "static" => Ok(format!("cargo:rustc-link-lib=static=python{}", ld_version)),
-        "shared" => Ok(format!("cargo:rustc-link-lib=python{}", ld_version)),
-        "framework" => Ok(format!("cargo:rustc-link-lib=python{}", ld_version)),
-        other => Err(format!("unknown linkmodel {}", other)),
-    }
-}
-
-/// Parse string as interpreter version.
-fn get_interpreter_version(line: &str) -> Result<PythonVersion, String> {
-    let version_re = Regex::new(r"\((\d+), (\d+)\)").unwrap();
-    match version_re.captures(&line) {
-        Some(cap) => Ok(PythonVersion {
-            major: cap.get(1).unwrap().as_str().parse().unwrap(),
-            minor: Some(cap.get(2).unwrap().as_str().parse().unwrap()),
-        }),
-        None => Err(format!("Unexpected response to version query {}", line)),
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn get_rustc_link_lib(version: &PythonVersion, _: &str, _: bool) -> Result<String, String> {
-    // Py_ENABLE_SHARED doesn't seem to be present on windows.
-    Ok(format!(
-        "cargo:rustc-link-lib=pythonXY:python{}{}",
-        version.major,
-        match version.minor {
-            Some(minor) => minor.to_string(),
-            None => "".to_owned(),
+    match out {
+        Err(err) => {
+            if err.kind() == io::ErrorKind::NotFound {
+                bail!(
+                    "Could not find any interpreter at {}, \
+                     are you sure you have Python installed on your PATH?",
+                    interpreter.display()
+                );
+            } else {
+                bail!(
+                    "Failed to run the Python interpreter at {}: {}",
+                    interpreter.display(),
+                    err
+                );
+            }
         }
-    ))
+        Ok(ok) if !ok.status.success() => bail!("Python script failed"),
+        Ok(ok) => Ok(String::from_utf8(ok.stdout)?),
+    }
+}
+
+fn get_rustc_link_lib(config: &InterpreterConfig) -> String {
+    let link_name = if env::var("CARGO_CFG_TARGET_OS").unwrap().as_str() == "windows" {
+        if is_abi3() {
+            // Link against python3.lib for the stable ABI on Windows.
+            // See https://www.python.org/dev/peps/pep-0384/#linkage
+            //
+            // This contains only the limited ABI symbols.
+            "pythonXY:python3".to_owned()
+        } else if env::var("CARGO_CFG_TARGET_ENV").unwrap().as_str() == "gnu" {
+            // https://packages.msys2.org/base/mingw-w64-python
+            format!(
+                "pythonXY:python{}.{}",
+                config.version.major, config.version.minor
+            )
+        } else {
+            format!(
+                "pythonXY:python{}{}",
+                config.version.major, config.version.minor
+            )
+        }
+    } else {
+        match config.implementation {
+            PythonInterpreterKind::CPython => format!("python{}", config.ld_version),
+            PythonInterpreterKind::PyPy => format!("pypy{}-c", config.version.major),
+        }
+    };
+
+    format!(
+        "cargo:rustc-link-lib={link_model}{link_name}",
+        link_model = if config.shared { "" } else { "static=" },
+        link_name = link_name
+    )
+}
+
+fn find_interpreter() -> Result<PathBuf> {
+    if let Some(exe) = env::var_os("PYO3_PYTHON") {
+        Ok(exe.into())
+    } else if let Some(exe) = env::var_os("PYTHON_SYS_EXECUTABLE") {
+        // Backwards-compatible name for PYO3_PYTHON; this may be removed at some point in the future.
+        Ok(exe.into())
+    } else {
+        ["python", "python3"]
+            .iter()
+            .find(|bin| {
+                if let Ok(out) = Command::new(bin).arg("--version").output() {
+                    // begin with `Python 3.X.X :: additional info`
+                    out.stdout.starts_with(b"Python 3") || out.stderr.starts_with(b"Python 3")
+                } else {
+                    false
+                }
+            })
+            .map(PathBuf::from)
+            .ok_or_else(|| "Python 3.x interpreter not found".into())
+    }
 }
 
 /// Locate a suitable python interpreter and extract config from it.
 ///
 /// The following locations are checked in the order listed:
 ///
-/// 1. If `PYTHON_SYS_EXECUTABLE` is set, this intepreter is used and an error is raised if the
+/// 1. If `PYO3_PYTHON` is set, this intepreter is used and an error is raised if the
 /// version doesn't match.
 /// 2. `python`
 /// 3. `python{major version}`
 /// 4. `python{major version}.{minor version}`
 ///
 /// If none of the above works, an error is returned
-fn find_interpreter_and_get_config(
-) -> Result<(PythonVersion, HashMap<String, String>, Vec<String>), String> {
-    let version = version_from_env();
-
-    if let Some(sys_executable) = env::var_os("PYTHON_SYS_EXECUTABLE") {
-        let interpreter_path = sys_executable
-            .to_str()
-            .expect("Unable to get PYTHON_SYS_EXECUTABLE value");
-        let (interpreter_version, lines) = get_config_from_interpreter(interpreter_path)?;
-        if version != None && version.as_ref().unwrap() != &interpreter_version {
-            panic!(
-                "Unsupported python version in PYTHON_SYS_EXECUTABLE={}\n\
-                 \tmin version {} != found {}",
-                interpreter_path,
-                version.unwrap(),
-                interpreter_version
-            );
-        } else {
-            return Ok((
-                interpreter_version,
-                fix_config_map(get_config_vars(interpreter_path)?),
-                lines,
-            ));
-        }
-    };
-
-    let expected_version = version.unwrap_or(PythonVersion {
-        major: 3,
-        minor: None,
-    });
-
-    // check default python
-    let interpreter_path = "python";
-    let (interpreter_version, lines) = get_config_from_interpreter(interpreter_path)?;
-    if expected_version == interpreter_version {
+fn find_interpreter_and_get_config() -> Result<(InterpreterConfig, BuildFlags)> {
+    let python_interpreter = find_interpreter()?;
+    let interpreter_config = get_config_from_interpreter(&python_interpreter)?;
+    if interpreter_config.version.major == 3 {
         return Ok((
-            interpreter_version,
-            fix_config_map(get_config_vars(interpreter_path)?),
-            lines,
+            interpreter_config,
+            BuildFlags::from_interpreter(&python_interpreter)?,
         ));
     }
 
-    let major_interpreter_path = &format!("python{}", expected_version.major);
-    let (interpreter_version, lines) = get_config_from_interpreter(major_interpreter_path)?;
-    if expected_version == interpreter_version {
-        return Ok((
-            interpreter_version,
-            fix_config_map(get_config_vars(major_interpreter_path)?),
-            lines,
-        ));
-    }
-
-    if let Some(minor) = expected_version.minor {
-        let minor_interpreter_path = &format!("python{}.{}", expected_version.major, minor);
-        let (interpreter_version, lines) = get_config_from_interpreter(minor_interpreter_path)?;
-        if expected_version == interpreter_version {
-            return Ok((
-                interpreter_version,
-                fix_config_map(get_config_vars(minor_interpreter_path)?),
-                lines,
-            ));
-        }
-    }
-
-    Err(format!("No python interpreter found"))
+    Err("No Python interpreter found".into())
 }
 
 /// Extract compilation vars from the specified interpreter.
-fn get_config_from_interpreter(interpreter: &str) -> Result<(PythonVersion, Vec<String>), String> {
+fn get_config_from_interpreter(interpreter: &Path) -> Result<InterpreterConfig> {
     let script = r#"
+import os.path
+import platform
+import struct
 import sys
-import sysconfig
+from sysconfig import get_config_var
 
-print(sys.version_info[0:2])
-print(sysconfig.get_config_var('LIBDIR'))
-print(sysconfig.get_config_var('Py_ENABLE_SHARED'))
-print(sysconfig.get_config_var('LDVERSION') or sysconfig.get_config_var('py_version_short'))
-print(sys.exec_prefix)
+PYPY = platform.python_implementation() == "PyPy"
+
+# Anaconda based python distributions have a static python executable, but include
+# the shared library. Use the shared library for embedding to avoid rust trying to
+# LTO the static library (and failing with newer gcc's, because it is old).
+ANACONDA = os.path.exists(os.path.join(sys.base_prefix, "conda-meta"))
+
+libdir = get_config_var("LIBDIR")
+
+print("version_major", sys.version_info[0])
+print("version_minor", sys.version_info[1])
+print("implementation", platform.python_implementation())
+if libdir is not None:
+    print("libdir", libdir)
+print("ld_version", get_config_var("LDVERSION") or get_config_var("py_version_short"))
+print("base_prefix", sys.base_prefix)
+print("framework", bool(get_config_var("PYTHONFRAMEWORK")))
+print("shared", PYPY or ANACONDA or bool(get_config_var("Py_ENABLE_SHARED")))
+print("executable", sys.executable)
+print("calcsize_pointer", struct.calcsize("P"))
 "#;
-    let out = run_python_script(interpreter, script)?;
-    let lines: Vec<String> = out.lines().map(|line| line.to_owned()).collect();
-    let interpreter_version = get_interpreter_version(&lines[0])?;
-    Ok((interpreter_version, lines))
-}
-
-fn configure(interpreter_version: &PythonVersion, lines: Vec<String>) -> Result<(String), String> {
-    let libpath: &str = &lines[1];
-    let enable_shared: &str = &lines[2];
-    let ld_version: &str = &lines[3];
-    let exec_prefix: &str = &lines[4];
-
-    let is_extension_module = env::var_os("CARGO_FEATURE_EXTENSION_MODULE").is_some();
-    if !is_extension_module || cfg!(target_os = "windows") {
-        println!(
-            "{}",
-            get_rustc_link_lib(&interpreter_version, ld_version, enable_shared == "1").unwrap()
-        );
-        if libpath != "None" {
-            println!("cargo:rustc-link-search=native={}", libpath);
-        } else if cfg!(target_os = "windows") {
-            println!("cargo:rustc-link-search=native={}\\libs", exec_prefix);
-        }
-    }
-
-    let mut flags = String::new();
-
-    if let PythonVersion {
-        major: 3,
-        minor: some_minor,
-    } = interpreter_version
-    {
-        if env::var_os("CARGO_FEATURE_ABI3").is_some() {
-            println!("cargo:rustc-cfg=Py_LIMITED_API");
-        }
-        if let Some(minor) = some_minor {
-            if minor < &PY3_MIN_MINOR {
-                return Err(format!(
-                    "Python 3 required version is 3.{}, current version is 3.{}",
-                    PY3_MIN_MINOR, minor
-                ));
-            }
-            for i in 5..(minor + 1) {
-                println!("cargo:rustc-cfg=Py_3_{}", i);
-                flags += format!("CFG_Py_3_{},", i).as_ref();
-            }
-            println!("cargo:rustc-cfg=Py_3");
-        }
-    } else {
-        println!("cargo:rustc-cfg=Py_2");
-        flags += format!("CFG_Py_2,").as_ref();
-    }
-    return Ok(flags);
-}
-
-/// Determine the python version we're supposed to be building
-/// from the features passed via the environment.
-///
-/// The environment variable can choose to omit a minor
-/// version if the user doesn't care.
-fn version_from_env() -> Option<PythonVersion> {
-    let re = Regex::new(r"CARGO_FEATURE_PYTHON(\d+)(_(\d+))?").unwrap();
-    // sort env::vars so we get more explicit version specifiers first
-    // so if the user passes e.g. the python-3 feature and the python-3-5
-    // feature, python-3-5 takes priority.
-    let mut vars = env::vars().collect::<Vec<_>>();
-    vars.sort_by(|a, b| b.cmp(a));
-    for (key, _) in vars {
-        match re.captures(&key) {
-            Some(cap) => {
-                return Some(PythonVersion {
-                    major: cap.get(1).unwrap().as_str().parse().unwrap(),
-                    minor: match cap.get(3) {
-                        Some(s) => Some(s.as_str().parse().unwrap()),
-                        None => None,
-                    },
-                });
-            }
-            None => (),
-        }
-    }
-    None
-}
-
-fn check_rustc_version() {
-    let ok_channel = supports_features();
-    let ok_version = is_min_version(MIN_VERSION);
-    let ok_date = is_min_date(MIN_DATE);
-
-    let print_version_err = |version: &str, date: &str| {
-        eprintln!(
-            "Installed version is: {} ({}). Minimum required: {} ({}).",
-            version, date, MIN_VERSION, MIN_DATE
-        );
+    let output = run_python_script(interpreter, script)?;
+    let map: HashMap<String, String> = parse_script_output(&output);
+    let shared = match (
+        env::var("CARGO_CFG_TARGET_OS").unwrap().as_str(),
+        map["framework"].as_str(),
+        map["shared"].as_str(),
+    ) {
+        (_, _, "True")            // Py_ENABLE_SHARED is set
+        | ("windows", _, _)       // Windows always uses shared linking
+        | ("macos", "True", _)    // MacOS framework package uses shared linking
+          => true,
+        (_, _, "False") => false, // Any other platform, Py_ENABLE_SHARED not set
+        _ => bail!("Unrecognised link model combination")
     };
 
-    match (ok_channel, ok_version, ok_date) {
-        (Some(ok_channel), Some((ok_version, version)), Some((ok_date, date))) => {
-            if !ok_channel {
-                eprintln!("Error: pyo3 requires a nightly or dev version of Rust.");
-                print_version_err(&*version, &*date);
-                panic!("Aborting compilation due to incompatible compiler.")
-            }
-
-            if !ok_version || !ok_date {
-                eprintln!("Error: pyo3 requires a more recent version of rustc.");
-                eprintln!("Use `rustup update` or your preferred method to update Rust");
-                print_version_err(&*version, &*date);
-                panic!("Aborting compilation due to incompatible compiler.")
-            }
-        }
-        _ => {
-            println!(
-                "cargo:warning={}",
-                "pyo3 was unable to check rustc compatibility."
-            );
-            println!(
-                "cargo:warning={}",
-                "Build may fail due to incompatible rustc version."
-            );
-        }
-    }
+    Ok(InterpreterConfig {
+        version: PythonVersion {
+            major: map["version_major"].parse()?,
+            minor: map["version_minor"].parse()?,
+        },
+        implementation: map["implementation"].parse()?,
+        libdir: map.get("libdir").cloned(),
+        shared,
+        ld_version: map["ld_version"].clone(),
+        base_prefix: map["base_prefix"].clone(),
+        executable: map["executable"].clone().into(),
+        calcsize_pointer: Some(map["calcsize_pointer"].parse()?),
+    })
 }
 
-fn main() {
-    check_rustc_version();
+fn configure(interpreter_config: &InterpreterConfig) -> Result<()> {
+    if interpreter_config.version.major == 2 {
+        // fail PYO3_PYTHON=python2 cargo ...
+        bail!("Python 2 is not supported");
+    }
+
+    if interpreter_config.version.minor < PY3_MIN_MINOR {
+        bail!(
+            "Python 3 required version is 3.{}, current version is 3.{}",
+            PY3_MIN_MINOR,
+            interpreter_config.version.minor
+        );
+    }
+
+    check_target_architecture(interpreter_config)?;
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let is_extension_module = env::var_os("CARGO_FEATURE_EXTENSION_MODULE").is_some();
+    match (is_extension_module, target_os.as_str()) {
+        (_, "windows") => {
+            // always link on windows, even with extension module
+            println!("{}", get_rustc_link_lib(&interpreter_config));
+            println!(
+                "cargo:rustc-link-search=native={}\\libs",
+                interpreter_config.base_prefix
+            );
+        }
+        (true, "macos") => {
+            // with extension module on macos some extra linker arguments are needed
+            println!("cargo:rustc-cdylib-link-arg=-undefined");
+            println!("cargo:rustc-cdylib-link-arg=dynamic_lookup");
+        }
+        (false, _) | (_, "android") => {
+            // other systems, only link libs if not extension module
+            // android always link.
+            println!("{}", get_rustc_link_lib(&interpreter_config));
+            if let Some(libdir) = &interpreter_config.libdir {
+                println!("cargo:rustc-link-search=native={}", libdir);
+            }
+        }
+        _ => {}
+    }
+
+    if env::var_os("CARGO_FEATURE_AUTO_INITIALIZE").is_some() {
+        ensure!(
+            interpreter_config.shared,
+            "The `auto-initialize` feature is enabled, but your python installation only supports \
+            embedding the Python interpreter statically. If you are attempting to run tests, or a \
+            binary which is okay to link dynamically, install a Python distribution which ships \
+            with the Python shared library.\n\
+            \n\
+            Embedding the Python interpreter statically does not yet have first-class support in \
+            PyO3. If you are sure you intend to do this, disable the `auto-initialize` feature.\n\
+            \n\
+            For more information, see \
+            https://pyo3.rs/v{pyo3_version}/\
+                building_and_distribution.html#embedding-python-in-rust",
+            pyo3_version = env::var("CARGO_PKG_VERSION").unwrap()
+        );
+
+        // TODO: PYO3_CI env is a hack to workaround CI with PyPy, where the `dev-dependencies`
+        // currently cause `auto-initialize` to be enabled in CI.
+        // Once cargo's `resolver = "2"` is stable (~ MSRV Rust 1.52), remove this.
+        ensure!(
+            !interpreter_config.is_pypy() || env::var_os("PYO3_CI").is_some(),
+            "The `auto-initialize` feature is not supported with PyPy."
+        );
+    }
+
+    let is_abi3 = is_abi3();
+
+    if interpreter_config.is_pypy() {
+        println!("cargo:rustc-cfg=PyPy");
+        if is_abi3 {
+            warn!(
+                "PyPy does not yet support abi3 so the build artifacts will be version-specific. \
+                See https://foss.heptapod.net/pypy/pypy/-/issues/3397 for more information."
+            )
+        }
+    };
+
+    let minor = if is_abi3 {
+        println!("cargo:rustc-cfg=Py_LIMITED_API");
+        // Check any `abi3-py3*` feature is set. If not, use the interpreter version.
+        match get_abi3_minor_version() {
+            Some(minor) if minor > interpreter_config.version.minor => bail!(
+                "You cannot set a mininimum Python version 3.{} higher than the interpreter version 3.{}",
+                minor,
+                interpreter_config.version.minor
+            ),
+            Some(minor) => minor,
+            None => interpreter_config.version.minor
+        }
+    } else {
+        interpreter_config.version.minor
+    };
+
+    for i in PY3_MIN_MINOR..=minor {
+        println!("cargo:rustc-cfg=Py_3_{}", i);
+    }
+
+    Ok(())
+}
+
+fn check_target_architecture(interpreter_config: &InterpreterConfig) -> Result<()> {
+    // Try to check whether the target architecture matches the python library
+    let rust_target = match env::var("CARGO_CFG_TARGET_POINTER_WIDTH")?.as_str() {
+        "64" => "64-bit",
+        "32" => "32-bit",
+        x => bail!("unexpected Rust target pointer width: {}", x),
+    };
+
+    // The reason we don't use platform.architecture() here is that it's not
+    // reliable on macOS. See https://stackoverflow.com/a/1405971/823869.
+    // Similarly, sys.maxsize is not reliable on Windows. See
+    // https://stackoverflow.com/questions/1405913/how-do-i-determine-if-my-python-shell-is-executing-in-32bit-or-64bit-mode-on-os/1405971#comment6209952_1405971
+    // and https://stackoverflow.com/a/3411134/823869.
+    let python_target = match interpreter_config.calcsize_pointer {
+        Some(8) => "64-bit",
+        Some(4) => "32-bit",
+        None => {
+            // Unset, e.g. because we're cross-compiling. Don't check anything
+            // in this case.
+            return Ok(());
+        }
+        Some(n) => bail!("unexpected Python calcsize_pointer value: {}", n),
+    };
+
+    if rust_target != python_target {
+        bail!(
+            "Your Rust target architecture ({}) does not match your python interpreter ({})",
+            rust_target,
+            python_target
+        );
+    }
+
+    Ok(())
+}
+
+fn get_abi3_minor_version() -> Option<u8> {
+    (PY3_MIN_MINOR..=ABI3_MAX_MINOR)
+        .find(|i| env::var_os(format!("CARGO_FEATURE_ABI3_PY3{}", i)).is_some())
+}
+
+fn abi3_without_interpreter() -> Result<()> {
+    println!("cargo:rustc-cfg=Py_LIMITED_API");
+    let mut flags = "FLAG_WITH_THREAD=1".to_string();
+    let abi_version = get_abi3_minor_version().unwrap_or(ABI3_MAX_MINOR);
+    for minor in PY3_MIN_MINOR..=abi_version {
+        println!("cargo:rustc-cfg=Py_3_{}", minor);
+        flags += &format!(",CFG_Py_3_{}", minor);
+    }
+    println!("cargo:rustc-cfg=py_sys_config=\"WITH_THREAD\"");
+    println!("cargo:python_flags={}", flags);
+
+    if env::var("CARGO_CFG_TARGET_FAMILY")? == "windows" {
+        // Unfortunately, on windows we can't build without at least providing
+        // python.lib to the linker. While maturin tells the linker the location
+        // of python.lib, we need to do the renaming here, otherwise cargo
+        // complains that the crate using pyo3 does not contains a `#[link(...)]`
+        // attribute with pythonXY.
+        println!("cargo:rustc-link-lib=pythonXY:python3");
+    }
+
+    Ok(())
+}
+
+fn main_impl() -> Result<()> {
+    // If PYO3_NO_PYTHON is set with abi3, we can build PyO3 without calling Python.
+    // We only check for the abi3-py3{ABI3_MAX_MINOR} because lower versions depend on it.
+    if env::var_os("PYO3_NO_PYTHON").is_some()
+        && env::var_os(format!("CARGO_FEATURE_ABI3_PY3{}", ABI3_MAX_MINOR)).is_some()
+    {
+        println!("cargo:rerun-if-env-changed=PYO3_NO_PYTHON");
+        return abi3_without_interpreter();
+    }
     // 1. Setup cfg variables so we can do conditional compilation in this library based on the
     // python interpeter's compilation flags. This is necessary for e.g. matching the right unicode
     // and threading interfaces.  First check if we're cross compiling, if so, we cannot run the
@@ -559,68 +905,51 @@ fn main() {
     // If you have troubles with your shell accepting '.' in a var name,
     // try using 'env' (sorry but this isn't our fault - it just has to
     // match the pkg-config package name, which is going to have a . in it).
-    let cross_compiling =
-        env::var("PYO3_CROSS_INCLUDE_DIR").is_ok() && env::var("PYO3_CROSS_LIB_DIR").is_ok();
-    let (interpreter_version, mut config_map, lines) = if cross_compiling {
-        load_cross_compile_info()
+    //
+    // Detecting if cross-compiling by checking if the target triple is different from the host
+    // rustc's triple.
+    let (interpreter_config, mut build_flags) = if let Some(paths) = cross_compiling()? {
+        load_cross_compile_info(paths)?
     } else {
-        find_interpreter_and_get_config()
-    }
-    .unwrap();
+        find_interpreter_and_get_config()?
+    };
 
-    let flags = configure(&interpreter_version, lines).unwrap();
+    build_flags.fixup(&interpreter_config);
+    configure(&interpreter_config)?;
 
-    // WITH_THREAD is always on for 3.7
-    if interpreter_version.major == 3 && interpreter_version.minor.unwrap_or(0) >= 7 {
-        config_map.insert("WITH_THREAD".to_owned(), "1".to_owned());
-    }
-
-    for (key, val) in &config_map {
-        match cfg_line_for_var(key, val) {
-            Some(line) => println!("{}", line),
-            None => (),
-        }
+    for flag in &build_flags.0 {
+        println!("cargo:rustc-cfg={}=\"{}\"", CFG_KEY, flag)
     }
 
-    // 2. Export python interpreter compilation flags as cargo variables that
-    // will be visible to dependents. All flags will be available to dependent
-    // build scripts in the environment variable DEP_PYTHON27_PYTHON_FLAGS as
-    // comma separated list; each item in the list looks like
-    //
-    // {VAL,FLAG}_{flag_name}=val;
-    //
-    // FLAG indicates the variable is always 0 or 1
-    // VAL indicates it can take on any value
-    //
-    // rust-cypthon/build.rs contains an example of how to unpack this data
-    // into cfg flags that replicate the ones present in this library, so
-    // you can use the same cfg syntax.
-    let flags: String = config_map.iter().fold("".to_owned(), |memo, (key, val)| {
-        if is_value(key) {
-            memo + format!("VAL_{}={},", key, val).as_ref()
-        } else if val != "0" {
-            memo + format!("FLAG_{}={},", key, val).as_ref()
-        } else {
-            memo
-        }
-    }) + flags.as_str();
-
-    println!(
-        "cargo:python_flags={}",
-        if flags.len() > 0 {
-            &flags[..flags.len() - 1]
-        } else {
-            ""
-        }
-    );
-
-    if env::var_os("TARGET") == Some("x86_64-apple-darwin".into()) {
-        // TODO: Find out how we can set -undefined dynamic_lookup here (if this is possible)
-    }
-
-    let env_vars = ["LD_LIBRARY_PATH", "PATH", "PYTHON_SYS_EXECUTABLE", "LIB"];
-
-    for var in env_vars.iter() {
+    for var in &[
+        "LIB",
+        "LD_LIBRARY_PATH",
+        "PYO3_PYTHON",
+        "PYO3_CROSS",
+        "PYO3_CROSS_LIB_DIR",
+        "PYO3_CROSS_PYTHON_VERSION",
+    ] {
         println!("cargo:rerun-if-env-changed={}", var);
     }
+
+    if env::var_os("PYO3_PYTHON").is_none() {
+        // When PYO3_PYTHON is not used, PYTHON_SYS_EXECUTABLE has the highest priority.
+        // Let's watch it.
+        println!("cargo:rerun-if-env-changed=PYTHON_SYS_EXECUTABLE");
+        if env::var_os("PYTHON_SYS_EXECUTABLE").is_none() {
+            // When PYTHON_SYS_EXECUTABLE is also not used, then we use PATH.
+            // Let's watch this, too.
+            println!("cargo:rerun-if-env-changed=PATH");
+        }
+    }
+
+    Ok(())
+}
+
+fn main() {
+    // Print out error messages using display, to get nicer formatting.
+    let _ = main_impl().map_err(|e| {
+        eprintln!("Error: {}", e);
+        std::process::exit(1)
+    });
 }

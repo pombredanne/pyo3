@@ -2,18 +2,13 @@
 
 //! Python Number Interface
 //! Trait and support implementation for implementing number protocol
-
-use crate::callback::PyObjectCallbackConverter;
-use crate::class::basic::PyObjectProtocolImpl;
-use crate::class::methods::PyMethodDef;
-use crate::err::PyResult;
-use crate::ffi;
-use crate::typeob::PyTypeInfo;
-use crate::{FromPyObject, IntoPyObject};
+use crate::callback::IntoPyCallbackOutput;
+use crate::err::PyErr;
+use crate::{ffi, FromPyObject, PyClass, PyObject};
 
 /// Number interface
 #[allow(unused_variables)]
-pub trait PyNumberProtocol<'p>: PyTypeInfo {
+pub trait PyNumberProtocol<'p>: PyClass {
     fn __add__(lhs: Self::Left, rhs: Self::Right) -> Self::Result
     where
         Self: PyNumberAddProtocol<'p>,
@@ -62,7 +57,7 @@ pub trait PyNumberProtocol<'p>: PyTypeInfo {
     {
         unimplemented!()
     }
-    fn __pow__(lhs: Self::Left, rhs: Self::Right, modulo: Self::Modulo) -> Self::Result
+    fn __pow__(lhs: Self::Left, rhs: Self::Right, modulo: Option<Self::Modulo>) -> Self::Result
     where
         Self: PyNumberPowProtocol<'p>,
     {
@@ -147,7 +142,7 @@ pub trait PyNumberProtocol<'p>: PyTypeInfo {
     {
         unimplemented!()
     }
-    fn __rpow__(&'p self, other: Self::Other) -> Self::Result
+    fn __rpow__(&'p self, other: Self::Other, modulo: Option<Self::Modulo>) -> Self::Result
     where
         Self: PyNumberRPowProtocol<'p>,
     {
@@ -226,7 +221,7 @@ pub trait PyNumberProtocol<'p>: PyTypeInfo {
     {
         unimplemented!()
     }
-    fn __ipow__(&'p mut self, other: Self::Other, modulo: Self::Modulo) -> Self::Result
+    fn __ipow__(&'p mut self, other: Self::Other) -> Self::Result
     where
         Self: PyNumberIPowProtocol<'p>,
     {
@@ -306,15 +301,15 @@ pub trait PyNumberProtocol<'p>: PyTypeInfo {
     {
         unimplemented!()
     }
-    fn __round__(&'p self) -> Self::Result
-    where
-        Self: PyNumberRoundProtocol<'p>,
-    {
-        unimplemented!()
-    }
     fn __index__(&'p self) -> Self::Result
     where
         Self: PyNumberIndexProtocol<'p>,
+    {
+        unimplemented!()
+    }
+    fn __round__(&'p self, ndigits: Option<Self::NDigits>) -> Self::Result
+    where
+        Self: PyNumberRoundProtocol<'p>,
     {
         unimplemented!()
     }
@@ -323,1285 +318,466 @@ pub trait PyNumberProtocol<'p>: PyTypeInfo {
 pub trait PyNumberAddProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberSubProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberMulProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberMatmulProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberTruedivProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberFloordivProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberModProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberDivmodProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberPowProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
     type Modulo: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberLShiftProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRShiftProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberAndProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberXorProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberOrProtocol<'p>: PyNumberProtocol<'p> {
     type Left: FromPyObject<'p>;
     type Right: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRAddProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRSubProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRMulProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRMatmulProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRTruedivProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRFloordivProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRModProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRDivmodProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRPowProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
     type Modulo: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
+#[allow(clippy::upper_case_acronyms)]
 pub trait PyNumberRLShiftProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
+#[allow(clippy::upper_case_acronyms)]
 pub trait PyNumberRRShiftProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRAndProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRXorProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberROrProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberIAddProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
 pub trait PyNumberISubProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
 pub trait PyNumberIMulProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
 pub trait PyNumberIMatmulProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
 pub trait PyNumberITruedivProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
 pub trait PyNumberIFloordivProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
 pub trait PyNumberIModProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
 pub trait PyNumberIDivmodProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
 pub trait PyNumberIPowProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Modulo: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
+#[allow(clippy::upper_case_acronyms)]
 pub trait PyNumberILShiftProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
+#[allow(clippy::upper_case_acronyms)]
 pub trait PyNumberIRShiftProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
 pub trait PyNumberIAndProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
 pub trait PyNumberIXorProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
 pub trait PyNumberIOrProtocol<'p>: PyNumberProtocol<'p> {
     type Other: FromPyObject<'p>;
-    type Result: Into<PyResult<()>>;
+    type Result: IntoPyCallbackOutput<()>;
 }
 
 pub trait PyNumberNegProtocol<'p>: PyNumberProtocol<'p> {
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberPosProtocol<'p>: PyNumberProtocol<'p> {
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberAbsProtocol<'p>: PyNumberProtocol<'p> {
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberInvertProtocol<'p>: PyNumberProtocol<'p> {
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberComplexProtocol<'p>: PyNumberProtocol<'p> {
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberIntProtocol<'p>: PyNumberProtocol<'p> {
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberFloatProtocol<'p>: PyNumberProtocol<'p> {
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberRoundProtocol<'p>: PyNumberProtocol<'p> {
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type NDigits: FromPyObject<'p>;
+    type Result: IntoPyCallbackOutput<PyObject>;
 }
 
 pub trait PyNumberIndexProtocol<'p>: PyNumberProtocol<'p> {
-    type Success: IntoPyObject;
-    type Result: Into<PyResult<Self::Success>>;
+    type Result: IntoPyCallbackOutput<PyObject>;
+}
+
+py_binary_fallback_num_func!(
+    add_radd,
+    T,
+    PyNumberAddProtocol::__add__,
+    PyNumberRAddProtocol::__radd__
+);
+py_binary_num_func!(add, PyNumberAddProtocol, T::__add__);
+py_binary_reversed_num_func!(radd, PyNumberRAddProtocol, T::__radd__);
+py_binary_fallback_num_func!(
+    sub_rsub,
+    T,
+    PyNumberSubProtocol::__sub__,
+    PyNumberRSubProtocol::__rsub__
+);
+py_binary_num_func!(sub, PyNumberSubProtocol, T::__sub__);
+py_binary_reversed_num_func!(rsub, PyNumberRSubProtocol, T::__rsub__);
+py_binary_fallback_num_func!(
+    mul_rmul,
+    T,
+    PyNumberMulProtocol::__mul__,
+    PyNumberRMulProtocol::__rmul__
+);
+py_binary_num_func!(mul, PyNumberMulProtocol, T::__mul__);
+py_binary_reversed_num_func!(rmul, PyNumberRMulProtocol, T::__rmul__);
+py_binary_num_func!(mod_, PyNumberModProtocol, T::__mod__);
+py_binary_fallback_num_func!(
+    divmod_rdivmod,
+    T,
+    PyNumberDivmodProtocol::__divmod__,
+    PyNumberRDivmodProtocol::__rdivmod__
+);
+py_binary_num_func!(divmod, PyNumberDivmodProtocol, T::__divmod__);
+py_binary_reversed_num_func!(rdivmod, PyNumberRDivmodProtocol, T::__rdivmod__);
+
+#[doc(hidden)]
+pub unsafe extern "C" fn pow_rpow<T>(
+    lhs: *mut ffi::PyObject,
+    rhs: *mut ffi::PyObject,
+    modulo: *mut ffi::PyObject,
+) -> *mut ffi::PyObject
+where
+    T: for<'p> PyNumberPowProtocol<'p> + for<'p> PyNumberRPowProtocol<'p>,
+{
+    crate::callback_body!(py, {
+        let lhs = py.from_borrowed_ptr::<crate::PyAny>(lhs);
+        let rhs = py.from_borrowed_ptr::<crate::PyAny>(rhs);
+        let modulo = py.from_borrowed_ptr::<crate::PyAny>(modulo);
+        // First, try __pow__
+        match (lhs.extract(), rhs.extract(), modulo.extract()) {
+            (Ok(l), Ok(r), Ok(m)) => T::__pow__(l, r, m).convert(py),
+            _ => {
+                // Then try __rpow__
+                let slf: &crate::PyCell<T> = extract_or_return_not_implemented!(rhs);
+                let arg = extract_or_return_not_implemented!(lhs);
+                let modulo = extract_or_return_not_implemented!(modulo);
+                slf.try_borrow()?.__rpow__(arg, modulo).convert(py)
+            }
+        }
+    })
 }
 
 #[doc(hidden)]
-pub trait PyNumberProtocolImpl: PyObjectProtocolImpl {
-    fn methods() -> Vec<PyMethodDef> {
-        Vec::new()
-    }
-    fn tp_as_number() -> Option<ffi::PyNumberMethods> {
-        if let Some(nb_bool) = <Self as PyObjectProtocolImpl>::nb_bool_fn() {
-            #[cfg(Py_3)]
-            let meth = ffi::PyNumberMethods {
-                nb_bool: Some(nb_bool),
-                ..ffi::PyNumberMethods_INIT
-            };
-
-            #[cfg(not(Py_3))]
-            let meth = ffi::PyNumberMethods {
-                nb_nonzero: Some(nb_bool),
-                ..ffi::PyNumberMethods_INIT
-            };
-            Some(meth)
-        } else {
-            None
-        }
-    }
-}
-
-impl<'p, T> PyNumberProtocolImpl for T {}
-
-impl<'p, T> PyNumberProtocolImpl for T
-where
-    T: PyNumberProtocol<'p>,
-{
-    #[cfg(Py_3)]
-    fn tp_as_number() -> Option<ffi::PyNumberMethods> {
-        Some(ffi::PyNumberMethods {
-            nb_add: Self::nb_add(),
-            nb_subtract: Self::nb_subtract(),
-            nb_multiply: Self::nb_multiply(),
-            nb_remainder: Self::nb_remainder(),
-            nb_divmod: Self::nb_divmod(),
-            nb_power: Self::nb_power(),
-            nb_negative: Self::nb_negative(),
-            nb_positive: Self::nb_positive(),
-            nb_absolute: Self::nb_absolute(),
-            nb_bool: <Self as PyObjectProtocolImpl>::nb_bool_fn(),
-            nb_invert: Self::nb_invert(),
-            nb_lshift: Self::nb_lshift(),
-            nb_rshift: Self::nb_rshift(),
-            nb_and: Self::nb_and(),
-            nb_xor: Self::nb_xor(),
-            nb_or: Self::nb_or(),
-            nb_int: Self::nb_int(),
-            nb_reserved: ::std::ptr::null_mut(),
-            nb_float: Self::nb_float(),
-            nb_inplace_add: Self::nb_inplace_add(),
-            nb_inplace_subtract: Self::nb_inplace_subtract(),
-            nb_inplace_multiply: Self::nb_inplace_multiply(),
-            nb_inplace_remainder: Self::nb_inplace_remainder(),
-            nb_inplace_power: Self::nb_inplace_power(),
-            nb_inplace_lshift: Self::nb_inplace_lshift(),
-            nb_inplace_rshift: Self::nb_inplace_rshift(),
-            nb_inplace_and: Self::nb_inplace_and(),
-            nb_inplace_xor: Self::nb_inplace_xor(),
-            nb_inplace_or: Self::nb_inplace_or(),
-            nb_floor_divide: Self::nb_floor_divide(),
-            nb_true_divide: Self::nb_true_divide(),
-            nb_inplace_floor_divide: Self::nb_inplace_floor_divide(),
-            nb_inplace_true_divide: Self::nb_inplace_true_divide(),
-            nb_index: Self::nb_index(),
-            nb_matrix_multiply: Self::nb_matrix_multiply(),
-            nb_inplace_matrix_multiply: Self::nb_inplace_matrix_multiply(),
-        })
-    }
-    #[cfg(not(Py_3))]
-    fn tp_as_number() -> Option<ffi::PyNumberMethods> {
-        Some(ffi::PyNumberMethods {
-            nb_add: Self::nb_add(),
-            nb_subtract: Self::nb_subtract(),
-            nb_multiply: Self::nb_multiply(),
-            nb_remainder: Self::nb_remainder(),
-            nb_divmod: Self::nb_divmod(),
-            nb_power: Self::nb_power(),
-            nb_negative: Self::nb_negative(),
-            nb_positive: Self::nb_positive(),
-            nb_absolute: Self::nb_absolute(),
-            nb_nonzero: <Self as PyObjectProtocolImpl>::nb_bool_fn(),
-            nb_invert: Self::nb_invert(),
-            nb_lshift: Self::nb_lshift(),
-            nb_rshift: Self::nb_rshift(),
-            nb_and: Self::nb_and(),
-            nb_xor: Self::nb_xor(),
-            nb_or: Self::nb_or(),
-            nb_c_int: Self::nb_int(),
-            nb_float: Self::nb_float(),
-            nb_inplace_add: Self::nb_inplace_add(),
-            nb_inplace_subtract: Self::nb_inplace_subtract(),
-            nb_inplace_multiply: Self::nb_inplace_multiply(),
-            nb_inplace_remainder: Self::nb_inplace_remainder(),
-            nb_inplace_power: Self::nb_inplace_power(),
-            nb_inplace_lshift: Self::nb_inplace_lshift(),
-            nb_inplace_rshift: Self::nb_inplace_rshift(),
-            nb_inplace_and: Self::nb_inplace_and(),
-            nb_inplace_xor: Self::nb_inplace_xor(),
-            nb_inplace_or: Self::nb_inplace_or(),
-            nb_floor_divide: Self::nb_floor_divide(),
-            nb_true_divide: Self::nb_true_divide(),
-            nb_inplace_floor_divide: Self::nb_inplace_floor_divide(),
-            nb_inplace_true_divide: Self::nb_inplace_true_divide(),
-            nb_index: Self::nb_index(),
-            nb_coerce: None,
-            nb_divide: None,
-            nb_hex: None,
-            nb_inplace_divide: None,
-            nb_long: None,
-            nb_oct: None,
-        })
-    }
-
-    #[inline]
-    fn methods() -> Vec<PyMethodDef> {
-        let mut methods = Vec::new();
-
-        if let Some(def) = <Self as PyNumberRAddProtocolImpl>::__radd__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRSubProtocolImpl>::__rsub__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRMulProtocolImpl>::__rmul__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRMatmulProtocolImpl>::__rmatmul__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRTruedivProtocolImpl>::__rtruediv__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRFloordivProtocolImpl>::__rfloordiv__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRModProtocolImpl>::__rmod__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRDivmodProtocolImpl>::__rdivmod__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRPowProtocolImpl>::__rpow__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRLShiftProtocolImpl>::__rlshift__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRRShiftProtocolImpl>::__rrshift__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRAndProtocolImpl>::__rand__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRXorProtocolImpl>::__rxor__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberROrProtocolImpl>::__ror__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberComplexProtocolImpl>::__complex__() {
-            methods.push(def)
-        }
-        if let Some(def) = <Self as PyNumberRoundProtocolImpl>::__round__() {
-            methods.push(def)
-        }
-
-        methods
-    }
-}
-
-trait PyNumberAddProtocolImpl {
-    fn nb_add() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberAddProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberAddProtocolImpl for T
-where
-    T: for<'p> PyNumberAddProtocol<'p>,
-{
-    fn nb_add() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberAddProtocol,
-            T::__add__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberSubProtocolImpl {
-    fn nb_subtract() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberSubProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberSubProtocolImpl for T
-where
-    T: for<'p> PyNumberSubProtocol<'p>,
-{
-    fn nb_subtract() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberSubProtocol,
-            T::__sub__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberMulProtocolImpl {
-    fn nb_multiply() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberMulProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberMulProtocolImpl for T
-where
-    T: for<'p> PyNumberMulProtocol<'p>,
-{
-    fn nb_multiply() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberMulProtocol,
-            T::__mul__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberMatmulProtocolImpl {
-    fn nb_matrix_multiply() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberMatmulProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberMatmulProtocolImpl for T
-where
-    T: for<'p> PyNumberMatmulProtocol<'p>,
-{
-    fn nb_matrix_multiply() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberMatmulProtocol,
-            T::__matmul__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberTruedivProtocolImpl {
-    fn nb_true_divide() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberTruedivProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberTruedivProtocolImpl for T
-where
-    T: for<'p> PyNumberTruedivProtocol<'p>,
-{
-    fn nb_true_divide() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberTruedivProtocol,
-            T::__truediv__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberFloordivProtocolImpl {
-    fn nb_floor_divide() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberFloordivProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberFloordivProtocolImpl for T
-where
-    T: for<'p> PyNumberFloordivProtocol<'p>,
-{
-    fn nb_floor_divide() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberFloordivProtocol,
-            T::__floordiv__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberModProtocolImpl {
-    fn nb_remainder() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberModProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberModProtocolImpl for T
-where
-    T: for<'p> PyNumberModProtocol<'p>,
-{
-    fn nb_remainder() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberModProtocol,
-            T::__mod__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberDivmodProtocolImpl {
-    fn nb_divmod() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberDivmodProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberDivmodProtocolImpl for T
-where
-    T: for<'p> PyNumberDivmodProtocol<'p>,
-{
-    fn nb_divmod() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberDivmodProtocol,
-            T::__divmod__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberPowProtocolImpl {
-    fn nb_power() -> Option<ffi::ternaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberPowProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberPowProtocolImpl for T
+pub unsafe extern "C" fn pow<T>(
+    lhs: *mut ffi::PyObject,
+    rhs: *mut ffi::PyObject,
+    modulo: *mut ffi::PyObject,
+) -> *mut ffi::PyObject
 where
     T: for<'p> PyNumberPowProtocol<'p>,
 {
-    fn nb_power() -> Option<ffi::ternaryfunc> {
-        py_ternary_num_func!(
-            PyNumberPowProtocol,
-            T::__pow__,
-            <T as PyNumberPowProtocol>::Success,
-            PyObjectCallbackConverter
-        )
-    }
+    crate::callback_body!(py, {
+        let lhs = extract_or_return_not_implemented!(py, lhs);
+        let rhs = extract_or_return_not_implemented!(py, rhs);
+        let modulo = extract_or_return_not_implemented!(py, modulo);
+        T::__pow__(lhs, rhs, modulo).convert(py)
+    })
 }
 
-trait PyNumberLShiftProtocolImpl {
-    fn nb_lshift() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberLShiftProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberLShiftProtocolImpl for T
+#[doc(hidden)]
+pub unsafe extern "C" fn rpow<T>(
+    arg: *mut ffi::PyObject,
+    slf: *mut ffi::PyObject,
+    modulo: *mut ffi::PyObject,
+) -> *mut ffi::PyObject
 where
-    T: for<'p> PyNumberLShiftProtocol<'p>,
+    T: for<'p> PyNumberRPowProtocol<'p>,
 {
-    fn nb_lshift() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberLShiftProtocol,
-            T::__lshift__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
+    crate::callback_body!(py, {
+        let slf: &crate::PyCell<T> = extract_or_return_not_implemented!(py, slf);
+        let arg = extract_or_return_not_implemented!(py, arg);
+        let modulo = extract_or_return_not_implemented!(py, modulo);
+        slf.try_borrow()?.__rpow__(arg, modulo).convert(py)
+    })
 }
 
-trait PyNumberRShiftProtocolImpl {
-    fn nb_rshift() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
+py_unary_func!(neg, PyNumberNegProtocol, T::__neg__);
+py_unary_func!(pos, PyNumberPosProtocol, T::__pos__);
+py_unary_func!(abs, PyNumberAbsProtocol, T::__abs__);
+py_unary_func!(invert, PyNumberInvertProtocol, T::__invert__);
+py_binary_fallback_num_func!(
+    lshift_rlshift,
+    T,
+    PyNumberLShiftProtocol::__lshift__,
+    PyNumberRLShiftProtocol::__rlshift__
+);
+py_binary_num_func!(lshift, PyNumberLShiftProtocol, T::__lshift__);
+py_binary_reversed_num_func!(rlshift, PyNumberRLShiftProtocol, T::__rlshift__);
+py_binary_fallback_num_func!(
+    rshift_rrshift,
+    T,
+    PyNumberRShiftProtocol::__rshift__,
+    PyNumberRRShiftProtocol::__rrshift__
+);
+py_binary_num_func!(rshift, PyNumberRShiftProtocol, T::__rshift__);
+py_binary_reversed_num_func!(rrshift, PyNumberRRShiftProtocol, T::__rrshift__);
+py_binary_fallback_num_func!(
+    and_rand,
+    T,
+    PyNumberAndProtocol::__and__,
+    PyNumberRAndProtocol::__rand__
+);
+py_binary_num_func!(and, PyNumberAndProtocol, T::__and__);
+py_binary_reversed_num_func!(rand, PyNumberRAndProtocol, T::__rand__);
+py_binary_fallback_num_func!(
+    xor_rxor,
+    T,
+    PyNumberXorProtocol::__xor__,
+    PyNumberRXorProtocol::__rxor__
+);
+py_binary_num_func!(xor, PyNumberXorProtocol, T::__xor__);
+py_binary_reversed_num_func!(rxor, PyNumberRXorProtocol, T::__rxor__);
+py_binary_fallback_num_func!(
+    or_ror,
+    T,
+    PyNumberOrProtocol::__or__,
+    PyNumberROrProtocol::__ror__
+);
+py_binary_num_func!(or, PyNumberOrProtocol, T::__or__);
+py_binary_reversed_num_func!(ror, PyNumberROrProtocol, T::__ror__);
+py_unary_func!(int, PyNumberIntProtocol, T::__int__);
+py_unary_func!(float, PyNumberFloatProtocol, T::__float__);
+py_binary_self_func!(iadd, PyNumberIAddProtocol, T::__iadd__);
+py_binary_self_func!(isub, PyNumberISubProtocol, T::__isub__);
+py_binary_self_func!(imul, PyNumberIMulProtocol, T::__imul__);
+py_binary_self_func!(imod, PyNumberIModProtocol, T::__imod__);
 
-impl<'p, T> PyNumberRShiftProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberRShiftProtocolImpl for T
-where
-    T: for<'p> PyNumberRShiftProtocol<'p>,
-{
-    fn nb_rshift() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberRShiftProtocol,
-            T::__rshift__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberAndProtocolImpl {
-    fn nb_and() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberAndProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberAndProtocolImpl for T
-where
-    T: for<'p> PyNumberAndProtocol<'p>,
-{
-    fn nb_and() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberAndProtocol,
-            T::__and__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberXorProtocolImpl {
-    fn nb_xor() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberXorProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberXorProtocolImpl for T
-where
-    T: for<'p> PyNumberXorProtocol<'p>,
-{
-    fn nb_xor() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberXorProtocol,
-            T::__xor__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberOrProtocolImpl {
-    fn nb_or() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberOrProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberOrProtocolImpl for T
-where
-    T: for<'p> PyNumberOrProtocol<'p>,
-{
-    fn nb_or() -> Option<ffi::binaryfunc> {
-        py_binary_num_func!(
-            PyNumberOrProtocol,
-            T::__or__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberIAddProtocolImpl {
-    fn nb_inplace_add() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberIAddProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberIAddProtocolImpl for T
-where
-    T: for<'p> PyNumberIAddProtocol<'p>,
-{
-    fn nb_inplace_add() -> Option<ffi::binaryfunc> {
-        py_binary_self_func!(PyNumberIAddProtocol, T::__iadd__)
-    }
-}
-
-trait PyNumberISubProtocolImpl {
-    fn nb_inplace_subtract() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberISubProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberISubProtocolImpl for T
-where
-    T: for<'p> PyNumberISubProtocol<'p>,
-{
-    fn nb_inplace_subtract() -> Option<ffi::binaryfunc> {
-        py_binary_self_func!(PyNumberISubProtocol, T::__isub__)
-    }
-}
-
-trait PyNumberIMulProtocolImpl {
-    fn nb_inplace_multiply() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberIMulProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberIMulProtocolImpl for T
-where
-    T: for<'p> PyNumberIMulProtocol<'p>,
-{
-    fn nb_inplace_multiply() -> Option<ffi::binaryfunc> {
-        py_binary_self_func!(PyNumberIMulProtocol, T::__imul__)
-    }
-}
-
-trait PyNumberIMatmulProtocolImpl {
-    fn nb_inplace_matrix_multiply() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberIMatmulProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberIMatmulProtocolImpl for T
-where
-    T: for<'p> PyNumberIMatmulProtocol<'p>,
-{
-    fn nb_inplace_matrix_multiply() -> Option<ffi::binaryfunc> {
-        py_binary_self_func!(PyNumberIMatmulProtocol, T::__imatmul__)
-    }
-}
-
-trait PyNumberITruedivProtocolImpl {
-    fn nb_inplace_true_divide() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberITruedivProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberITruedivProtocolImpl for T
-where
-    T: for<'p> PyNumberITruedivProtocol<'p>,
-{
-    fn nb_inplace_true_divide() -> Option<ffi::binaryfunc> {
-        py_binary_self_func!(PyNumberITruedivProtocol, T::__itruediv__)
-    }
-}
-
-trait PyNumberIFloordivProtocolImpl {
-    fn nb_inplace_floor_divide() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberIFloordivProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberIFloordivProtocolImpl for T
-where
-    T: for<'p> PyNumberIFloordivProtocol<'p>,
-{
-    fn nb_inplace_floor_divide() -> Option<ffi::binaryfunc> {
-        py_binary_self_func!(PyNumberIFloordivProtocol, T::__ifloordiv__)
-    }
-}
-
-trait PyNumberIModProtocolImpl {
-    fn nb_inplace_remainder() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberIModProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberIModProtocolImpl for T
-where
-    T: for<'p> PyNumberIModProtocol<'p>,
-{
-    fn nb_inplace_remainder() -> Option<ffi::binaryfunc> {
-        py_binary_self_func!(PyNumberIModProtocol, T::__imod__)
-    }
-}
-
-trait PyNumberIPowProtocolImpl {
-    fn nb_inplace_power() -> Option<ffi::ternaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberIPowProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberIPowProtocolImpl for T
+#[doc(hidden)]
+pub unsafe extern "C" fn ipow<T>(
+    slf: *mut ffi::PyObject,
+    other: *mut ffi::PyObject,
+    _modulo: *mut ffi::PyObject,
+) -> *mut ffi::PyObject
 where
     T: for<'p> PyNumberIPowProtocol<'p>,
 {
-    fn nb_inplace_power() -> Option<ffi::ternaryfunc> {
-        py_ternary_self_func!(PyNumberIPowProtocol, T::__ipow__)
-    }
+    // NOTE: Somehow __ipow__ causes SIGSEGV in Python < 3.8 when we extract,
+    // so we ignore it. It's the same as what CPython does.
+    crate::callback_body!(py, {
+        let slf_cell = py.from_borrowed_ptr::<crate::PyCell<T>>(slf);
+        let other = py.from_borrowed_ptr::<crate::PyAny>(other);
+        call_operator_mut!(py, slf_cell, __ipow__, other).convert(py)?;
+        ffi::Py_INCREF(slf);
+        Ok::<_, PyErr>(slf)
+    })
 }
 
-trait PyNumberILShiftProtocolImpl {
-    fn nb_inplace_lshift() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberILShiftProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberILShiftProtocolImpl for T
-where
-    T: for<'p> PyNumberILShiftProtocol<'p>,
-{
-    fn nb_inplace_lshift() -> Option<ffi::binaryfunc> {
-        py_binary_self_func!(PyNumberILShiftProtocol, T::__ilshift__)
-    }
-}
-
-trait PyNumberIRShiftProtocolImpl {
-    fn nb_inplace_rshift() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberIRShiftProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberIRShiftProtocolImpl for T
-where
-    T: for<'p> PyNumberIRShiftProtocol<'p>,
-{
-    fn nb_inplace_rshift() -> Option<ffi::binaryfunc> {
-        py_binary_self_func!(PyNumberIRShiftProtocol, T::__irshift__)
-    }
-}
-
-trait PyNumberIAndProtocolImpl {
-    fn nb_inplace_and() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberIAndProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberIAndProtocolImpl for T
-where
-    T: for<'p> PyNumberIAndProtocol<'p>,
-{
-    fn nb_inplace_and() -> Option<ffi::binaryfunc> {
-        py_binary_self_func!(PyNumberIAndProtocol, T::__iand__)
-    }
-}
-
-trait PyNumberIXorProtocolImpl {
-    fn nb_inplace_xor() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberIXorProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberIXorProtocolImpl for T
-where
-    T: for<'p> PyNumberIXorProtocol<'p>,
-{
-    fn nb_inplace_xor() -> Option<ffi::binaryfunc> {
-        py_binary_self_func!(PyNumberIXorProtocol, T::__ixor__)
-    }
-}
-
-trait PyNumberIOrProtocolImpl {
-    fn nb_inplace_or() -> Option<ffi::binaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberIOrProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberIOrProtocolImpl for T
-where
-    T: for<'p> PyNumberIOrProtocol<'p>,
-{
-    fn nb_inplace_or() -> Option<ffi::binaryfunc> {
-        py_binary_self_func!(PyNumberIOrProtocol, T::__ior__)
-    }
-}
-
-trait PyNumberRAddProtocolImpl {
-    fn __radd__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRAddProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRSubProtocolImpl {
-    fn __rsub__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRSubProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRMulProtocolImpl {
-    fn __rmul__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRMulProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRMatmulProtocolImpl {
-    fn __rmatmul__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRMatmulProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRTruedivProtocolImpl {
-    fn __rtruediv__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRTruedivProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRFloordivProtocolImpl {
-    fn __rfloordiv__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRFloordivProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRModProtocolImpl {
-    fn __rmod__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRModProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRDivmodProtocolImpl {
-    fn __rdivmod__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRDivmodProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRPowProtocolImpl {
-    fn __rpow__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRPowProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRLShiftProtocolImpl {
-    fn __rlshift__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRLShiftProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRRShiftProtocolImpl {
-    fn __rrshift__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRRShiftProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRAndProtocolImpl {
-    fn __rand__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRAndProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRXorProtocolImpl {
-    fn __rxor__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRXorProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberROrProtocolImpl {
-    fn __ror__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberROrProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberNegProtocolImpl {
-    fn nb_negative() -> Option<ffi::unaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberNegProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberNegProtocolImpl for T
-where
-    T: for<'p> PyNumberNegProtocol<'p>,
-{
-    #[inline]
-    fn nb_negative() -> Option<ffi::unaryfunc> {
-        py_unary_func!(
-            PyNumberNegProtocol,
-            T::__neg__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberPosProtocolImpl {
-    fn nb_positive() -> Option<ffi::unaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberPosProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberPosProtocolImpl for T
-where
-    T: for<'p> PyNumberPosProtocol<'p>,
-{
-    fn nb_positive() -> Option<ffi::unaryfunc> {
-        py_unary_func!(
-            PyNumberPosProtocol,
-            T::__pos__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberAbsProtocolImpl {
-    fn nb_absolute() -> Option<ffi::unaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberAbsProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberAbsProtocolImpl for T
-where
-    T: for<'p> PyNumberAbsProtocol<'p>,
-{
-    fn nb_absolute() -> Option<ffi::unaryfunc> {
-        py_unary_func!(
-            PyNumberAbsProtocol,
-            T::__abs__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberInvertProtocolImpl {
-    fn nb_invert() -> Option<ffi::unaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberInvertProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberInvertProtocolImpl for T
-where
-    T: for<'p> PyNumberInvertProtocol<'p>,
-{
-    fn nb_invert() -> Option<ffi::unaryfunc> {
-        py_unary_func!(
-            PyNumberInvertProtocol,
-            T::__invert__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberIntProtocolImpl {
-    fn nb_int() -> Option<ffi::unaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberIntProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberIntProtocolImpl for T
-where
-    T: for<'p> PyNumberIntProtocol<'p>,
-{
-    fn nb_int() -> Option<ffi::unaryfunc> {
-        py_unary_func!(
-            PyNumberIntProtocol,
-            T::__int__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberFloatProtocolImpl {
-    fn nb_float() -> Option<ffi::unaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberFloatProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberFloatProtocolImpl for T
-where
-    T: for<'p> PyNumberFloatProtocol<'p>,
-{
-    fn nb_float() -> Option<ffi::unaryfunc> {
-        py_unary_func!(
-            PyNumberFloatProtocol,
-            T::__float__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberIndexProtocolImpl {
-    fn nb_index() -> Option<ffi::unaryfunc> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberIndexProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-impl<T> PyNumberIndexProtocolImpl for T
-where
-    T: for<'p> PyNumberIndexProtocol<'p>,
-{
-    fn nb_index() -> Option<ffi::unaryfunc> {
-        py_unary_func!(
-            PyNumberIndexProtocol,
-            T::__index__,
-            T::Success,
-            PyObjectCallbackConverter
-        )
-    }
-}
-
-trait PyNumberComplexProtocolImpl {
-    fn __complex__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberComplexProtocolImpl for T where T: PyNumberProtocol<'p> {}
-
-trait PyNumberRoundProtocolImpl {
-    fn __round__() -> Option<PyMethodDef> {
-        None
-    }
-}
-
-impl<'p, T> PyNumberRoundProtocolImpl for T where T: PyNumberProtocol<'p> {}
+py_binary_self_func!(ilshift, PyNumberILShiftProtocol, T::__ilshift__);
+py_binary_self_func!(irshift, PyNumberIRShiftProtocol, T::__irshift__);
+py_binary_self_func!(iand, PyNumberIAndProtocol, T::__iand__);
+py_binary_self_func!(ixor, PyNumberIXorProtocol, T::__ixor__);
+py_binary_self_func!(ior, PyNumberIOrProtocol, T::__ior__);
+py_binary_fallback_num_func!(
+    floordiv_rfloordiv,
+    T,
+    PyNumberFloordivProtocol::__floordiv__,
+    PyNumberRFloordivProtocol::__rfloordiv__
+);
+py_binary_num_func!(floordiv, PyNumberFloordivProtocol, T::__floordiv__);
+py_binary_reversed_num_func!(rfloordiv, PyNumberRFloordivProtocol, T::__rfloordiv__);
+py_binary_fallback_num_func!(
+    truediv_rtruediv,
+    T,
+    PyNumberTruedivProtocol::__truediv__,
+    PyNumberRTruedivProtocol::__rtruediv__
+);
+py_binary_num_func!(truediv, PyNumberTruedivProtocol, T::__truediv__);
+py_binary_reversed_num_func!(rtruediv, PyNumberRTruedivProtocol, T::__rtruediv__);
+py_binary_self_func!(ifloordiv, PyNumberIFloordivProtocol, T::__ifloordiv__);
+py_binary_self_func!(itruediv, PyNumberITruedivProtocol, T::__itruediv__);
+py_unary_func!(index, PyNumberIndexProtocol, T::__index__);
+py_binary_fallback_num_func!(
+    matmul_rmatmul,
+    T,
+    PyNumberMatmulProtocol::__matmul__,
+    PyNumberRMatmulProtocol::__rmatmul__
+);
+py_binary_num_func!(matmul, PyNumberMatmulProtocol, T::__matmul__);
+py_binary_reversed_num_func!(rmatmul, PyNumberRMatmulProtocol, T::__rmatmul__);
+py_binary_self_func!(imatmul, PyNumberIMatmulProtocol, T::__imatmul__);

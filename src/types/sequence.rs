@@ -1,22 +1,23 @@
 // Copyright (c) 2017-present PyO3 Project and Contributors
 
-use crate::buffer;
-use crate::conversion::{FromPyObject, PyTryFrom, ToBorrowedObject};
 use crate::err::{self, PyDowncastError, PyErr, PyResult};
+use crate::exceptions;
 use crate::ffi::{self, Py_ssize_t};
-use crate::instance::PyObjectWithGIL;
-use crate::object::PyObject;
-use crate::objectprotocol::ObjectProtocol;
-use crate::python::ToPyPointer;
-use crate::types::{PyList, PyObjectRef, PyTuple};
+use crate::instance::PyNativeType;
+use crate::types::{PyAny, PyList, PyTuple};
+use crate::AsPyPointer;
+use crate::{FromPyObject, PyTryFrom, ToBorrowedObject};
 
-/// Represents a reference to a python object supporting the sequence protocol.
+/// Represents a reference to a Python object supporting the sequence protocol.
 #[repr(transparent)]
-pub struct PySequence(PyObject);
+pub struct PySequence(PyAny);
 pyobject_native_type_named!(PySequence);
+pyobject_native_type_extract!(PySequence);
 
 impl PySequence {
-    /// Returns the number of objects in sequence. This is equivalent to Python `len()`.
+    /// Returns the number of objects in sequence.
+    ///
+    /// This is equivalent to the Python expression `len(self)`.
     #[inline]
     pub fn len(&self) -> PyResult<isize> {
         let v = unsafe { ffi::PySequence_Size(self.as_ptr()) };
@@ -27,37 +28,47 @@ impl PySequence {
         }
     }
 
-    /// Return the concatenation of o1 and o2. Equivalent to python `o1 + o2`
+    #[inline]
+    pub fn is_empty(&self) -> PyResult<bool> {
+        self.len().map(|l| l == 0)
+    }
+
+    /// Returns the concatenation of `self` and `other`.
+    ///
+    /// This is equivalent to the Python expression `self + other`.
     #[inline]
     pub fn concat(&self, other: &PySequence) -> PyResult<&PySequence> {
         unsafe {
             let ptr = self
                 .py()
-                .from_owned_ptr_or_err::<PyObjectRef>(ffi::PySequence_Concat(
+                .from_owned_ptr_or_err::<PyAny>(ffi::PySequence_Concat(
                     self.as_ptr(),
                     other.as_ptr(),
                 ))?;
-            Ok(&*(ptr as *const PyObjectRef as *const PySequence))
+            Ok(&*(ptr as *const PyAny as *const PySequence))
         }
     }
 
-    /// Return the result of repeating sequence object o count times.
-    /// Equivalent to python `o * count`
+    /// Returns the result of repeating a sequence object `count` times.
+    ///
+    /// This is equivalent to the Python expression `self * count`.
     /// NB: Python accepts negative counts; it returns an empty Sequence.
     #[inline]
     pub fn repeat(&self, count: isize) -> PyResult<&PySequence> {
         unsafe {
             let ptr = self
                 .py()
-                .from_owned_ptr_or_err::<PyObjectRef>(ffi::PySequence_Repeat(
+                .from_owned_ptr_or_err::<PyAny>(ffi::PySequence_Repeat(
                     self.as_ptr(),
                     count as Py_ssize_t,
                 ))?;
-            Ok(&*(ptr as *const PyObjectRef as *const PySequence))
+            Ok(&*(ptr as *const PyAny as *const PySequence))
         }
     }
 
-    /// Concatenate of o1 and o2 on success. Equivalent to python `o1 += o2`
+    /// Concatenates `self` and `other` in place.
+    ///
+    /// This is equivalent to the Python statement `self += other`.
     #[inline]
     pub fn in_place_concat(&self, other: &PySequence) -> PyResult<()> {
         unsafe {
@@ -70,8 +81,9 @@ impl PySequence {
         }
     }
 
-    /// Repeate sequence object o count times and store in self.
-    /// Equivalent to python `o *= count`
+    /// Repeats the sequence object `count` times and updates `self`.
+    ///
+    /// This is equivalent to the Python statement `self *= count`.
     /// NB: Python accepts negative counts; it empties the Sequence.
     #[inline]
     pub fn in_place_repeat(&self, count: isize) -> PyResult<()> {
@@ -85,19 +97,22 @@ impl PySequence {
         }
     }
 
-    /// Return the ith element of the Sequence. Equivalent to python `o[index]`
+    /// Returns the `index`th element of the Sequence.
+    ///
+    /// This is equivalent to the Python expression `self[index]`.
     #[inline]
-    pub fn get_item(&self, index: isize) -> PyResult<&PyObjectRef> {
+    pub fn get_item(&self, index: isize) -> PyResult<&PyAny> {
         unsafe {
             self.py()
                 .from_owned_ptr_or_err(ffi::PySequence_GetItem(self.as_ptr(), index as Py_ssize_t))
         }
     }
 
-    /// Return the slice of sequence object o between begin and end.
-    /// This is the equivalent of the Python expression `o[begin:end]`
+    /// Returns the slice of sequence object between `begin` and `end`.
+    ///
+    /// This is equivalent to the Python expression `self[begin:end]`.
     #[inline]
-    pub fn get_slice(&self, begin: isize, end: isize) -> PyResult<&PyObjectRef> {
+    pub fn get_slice(&self, begin: isize, end: isize) -> PyResult<&PyAny> {
         unsafe {
             self.py().from_owned_ptr_or_err(ffi::PySequence_GetSlice(
                 self.as_ptr(),
@@ -107,8 +122,9 @@ impl PySequence {
         }
     }
 
-    /// Assign object v to the ith element of o.
-    /// Equivalent to Python statement `o[i] = v`
+    /// Assigns object `item` to the `i`th element of self.
+    ///
+    /// This is equivalent to the Python statement `self[i] = v`.
     #[inline]
     pub fn set_item<I>(&self, i: isize, item: I) -> PyResult<()>
     where
@@ -124,8 +140,9 @@ impl PySequence {
         }
     }
 
-    /// Delete the ith element of object o.
-    /// Python statement `del o[i]`
+    /// Deletes the `i`th element of self.
+    ///
+    /// This is equivalent to the Python statement `del self[i]`.
     #[inline]
     pub fn del_item(&self, i: isize) -> PyResult<()> {
         unsafe {
@@ -136,10 +153,11 @@ impl PySequence {
         }
     }
 
-    /// Assign the sequence object v to the slice in sequence object o from i1 to i2.
-    /// This is the equivalent of the Python statement `o[i1:i2] = v`
+    /// Assigns the sequence `v` to the slice of `self` from `i1` to `i2`.
+    ///
+    /// This is equivalent to the Python statement `self[i1:i2] = v`.
     #[inline]
-    pub fn set_slice(&self, i1: isize, i2: isize, v: &PyObjectRef) -> PyResult<()> {
+    pub fn set_slice(&self, i1: isize, i2: isize, v: &PyAny) -> PyResult<()> {
         unsafe {
             err::error_on_minusone(
                 self.py(),
@@ -153,8 +171,9 @@ impl PySequence {
         }
     }
 
-    /// Delete the slice in sequence object o from i1 to i2.
-    /// equivalent of the Python statement `del o[i1:i2]`
+    /// Deletes the slice from `i1` to `i2` from `self`.
+    ///
+    /// This is equivalent to the Python statement `del self[i1:i2]`.
     #[inline]
     pub fn del_slice(&self, i1: isize, i2: isize) -> PyResult<()> {
         unsafe {
@@ -165,9 +184,10 @@ impl PySequence {
         }
     }
 
-    /// Return the number of occurrences of value in o, that is, return the number of keys for
-    /// which `o[key] == value`
+    /// Returns the number of occurrences of `value` in self, that is, return the
+    /// number of keys for which `self[key] == value`.
     #[inline]
+    #[cfg(not(PyPy))]
     pub fn count<V>(&self, value: V) -> PyResult<usize>
     where
         V: ToBorrowedObject,
@@ -182,7 +202,9 @@ impl PySequence {
         }
     }
 
-    /// Determine if o contains value. this is equivalent to the Python expression `value in o`
+    /// Determines if self contains `value`.
+    ///
+    /// This is equivalent to the Python expression `value in self`.
     #[inline]
     pub fn contains<V>(&self, value: V) -> PyResult<bool>
     where
@@ -198,8 +220,9 @@ impl PySequence {
         }
     }
 
-    /// Return the first index `i` for which `o[i] == value`.
-    /// This is equivalent to the Python expression `o.index(value)`
+    /// Returns the first index `i` for which `self[i] == value`.
+    ///
+    /// This is equivalent to the Python expression `self.index(value)`.
     #[inline]
     pub fn index<V>(&self, value: V) -> PyResult<usize>
     where
@@ -215,7 +238,7 @@ impl PySequence {
         }
     }
 
-    /// Return a fresh list based on the Sequence.
+    /// Returns a fresh list based on the Sequence.
     #[inline]
     pub fn list(&self) -> PyResult<&PyList> {
         unsafe {
@@ -224,7 +247,7 @@ impl PySequence {
         }
     }
 
-    /// Return a fresh tuple based on the Sequence.
+    /// Returns a fresh tuple based on the Sequence.
     #[inline]
     pub fn tuple(&self) -> PyResult<&PyTuple> {
         unsafe {
@@ -234,24 +257,83 @@ impl PySequence {
     }
 }
 
+macro_rules! array_impls {
+    ($($N:expr),+) => {
+        $(
+            impl<'a, T> FromPyObject<'a> for [T; $N]
+            where
+                T: Copy + Default + FromPyObject<'a>,
+            {
+                #[cfg(not(feature = "nightly"))]
+                fn extract(obj: &'a PyAny) -> PyResult<Self> {
+                    let mut array = [T::default(); $N];
+                    extract_sequence_into_slice(obj, &mut array)?;
+                    Ok(array)
+                }
+
+                #[cfg(feature = "nightly")]
+                default fn extract(obj: &'a PyAny) -> PyResult<Self> {
+                    let mut array = [T::default(); $N];
+                    extract_sequence_into_slice(obj, &mut array)?;
+                    Ok(array)
+                }
+            }
+
+            #[cfg(feature = "nightly")]
+            impl<'source, T> FromPyObject<'source> for [T; $N]
+            where
+                for<'a> T: Default + FromPyObject<'a> + crate::buffer::Element,
+            {
+                fn extract(obj: &'source PyAny) -> PyResult<Self> {
+                    let mut array = [T::default(); $N];
+                    // first try buffer protocol
+                    if unsafe { ffi::PyObject_CheckBuffer(obj.as_ptr()) } == 1 {
+                        if let Ok(buf) = crate::buffer::PyBuffer::get(obj) {
+                            if buf.dimensions() == 1 && buf.copy_to_slice(obj.py(), &mut array).is_ok() {
+                                buf.release(obj.py());
+                                return Ok(array);
+                            }
+                            buf.release(obj.py());
+                        }
+                    }
+                    // fall back to sequence protocol
+                    extract_sequence_into_slice(obj, &mut array)?;
+                    Ok(array)
+                }
+            }
+        )+
+    }
+}
+
+array_impls!(
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31, 32
+);
+
 impl<'a, T> FromPyObject<'a> for Vec<T>
 where
     T: FromPyObject<'a>,
 {
-    default fn extract(obj: &'a PyObjectRef) -> PyResult<Self> {
+    #[cfg(not(feature = "nightly"))]
+    fn extract(obj: &'a PyAny) -> PyResult<Self> {
+        extract_sequence(obj)
+    }
+    #[cfg(feature = "nightly")]
+    default fn extract(obj: &'a PyAny) -> PyResult<Self> {
         extract_sequence(obj)
     }
 }
 
+#[cfg(feature = "nightly")]
 impl<'source, T> FromPyObject<'source> for Vec<T>
 where
-    for<'a> T: FromPyObject<'a> + buffer::Element + Copy,
+    for<'a> T: FromPyObject<'a> + crate::buffer::Element,
 {
-    fn extract(obj: &'source PyObjectRef) -> PyResult<Self> {
+    fn extract(obj: &'source PyAny) -> PyResult<Self> {
         // first try buffer protocol
-        if let Ok(buf) = buffer::PyBuffer::get(obj.py(), obj) {
+        if let Ok(buf) = crate::buffer::PyBuffer::get(obj) {
             if buf.dimensions() == 1 {
-                if let Ok(v) = buf.to_vec::<T>(obj.py()) {
+                if let Ok(v) = buf.to_vec(obj.py()) {
                     buf.release(obj.py());
                     return Ok(v);
                 }
@@ -263,7 +345,7 @@ where
     }
 }
 
-fn extract_sequence<'s, T>(obj: &'s PyObjectRef) -> PyResult<Vec<T>>
+fn extract_sequence<'s, T>(obj: &'s PyAny) -> PyResult<Vec<T>>
 where
     T: FromPyObject<'s>,
 {
@@ -275,64 +357,51 @@ where
     Ok(v)
 }
 
+fn extract_sequence_into_slice<'s, T>(obj: &'s PyAny, slice: &mut [T]) -> PyResult<()>
+where
+    T: FromPyObject<'s>,
+{
+    let seq = <PySequence as PyTryFrom>::try_from(obj)?;
+    if seq.len()? as usize != slice.len() {
+        return Err(exceptions::PyBufferError::new_err(
+            "Slice length does not match buffer length.",
+        ));
+    }
+    for (value, item) in slice.iter_mut().zip(seq.iter()?) {
+        *value = item?.extract::<T>()?;
+    }
+    Ok(())
+}
+
 impl<'v> PyTryFrom<'v> for PySequence {
-    fn try_from<V: Into<&'v PyObjectRef>>(value: V) -> Result<&'v PySequence, PyDowncastError> {
+    fn try_from<V: Into<&'v PyAny>>(value: V) -> Result<&'v PySequence, PyDowncastError<'v>> {
         let value = value.into();
         unsafe {
             if ffi::PySequence_Check(value.as_ptr()) != 0 {
                 Ok(<PySequence as PyTryFrom>::try_from_unchecked(value))
             } else {
-                Err(PyDowncastError)
+                Err(PyDowncastError::new(value, "Sequence"))
             }
         }
     }
 
-    fn try_from_exact<V: Into<&'v PyObjectRef>>(
-        value: V,
-    ) -> Result<&'v PySequence, PyDowncastError> {
+    fn try_from_exact<V: Into<&'v PyAny>>(value: V) -> Result<&'v PySequence, PyDowncastError<'v>> {
         <PySequence as PyTryFrom>::try_from(value)
     }
 
-    fn try_from_mut<V: Into<&'v PyObjectRef>>(
-        value: V,
-    ) -> Result<&'v mut PySequence, PyDowncastError> {
-        let value = value.into();
-        unsafe {
-            if ffi::PySequence_Check(value.as_ptr()) != 0 {
-                Ok(<PySequence as PyTryFrom>::try_from_mut_unchecked(value))
-            } else {
-                Err(PyDowncastError)
-            }
-        }
-    }
-
-    fn try_from_mut_exact<V: Into<&'v PyObjectRef>>(
-        value: V,
-    ) -> Result<&'v mut PySequence, PyDowncastError> {
-        <PySequence as PyTryFrom>::try_from_mut(value)
-    }
-
     #[inline]
-    unsafe fn try_from_unchecked<V: Into<&'v PyObjectRef>>(value: V) -> &'v PySequence {
+    unsafe fn try_from_unchecked<V: Into<&'v PyAny>>(value: V) -> &'v PySequence {
         let ptr = value.into() as *const _ as *const PySequence;
         &*ptr
-    }
-
-    #[inline]
-    unsafe fn try_from_mut_unchecked<V: Into<&'v PyObjectRef>>(value: V) -> &'v mut PySequence {
-        let ptr = value.into() as *const _ as *mut PySequence;
-        &mut *ptr
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::conversion::{PyTryFrom, ToPyObject};
-    use crate::instance::AsPyRef;
-    use crate::object::PyObject;
-    use crate::objectprotocol::ObjectProtocol;
-    use crate::python::{Python, ToPyPointer};
     use crate::types::PySequence;
+    use crate::AsPyPointer;
+    use crate::Python;
+    use crate::{PyObject, PyTryFrom, ToPyObject};
 
     fn get_object() -> PyObject {
         // Convenience function for getting a single unique object
@@ -466,8 +535,8 @@ mod test {
         }
         {
             let gil = Python::acquire_gil();
-            let _py = gil.python();
-            assert_eq!(1, obj.get_refcnt());
+            let py = gil.python();
+            assert_eq!(1, obj.get_refcnt(py));
         }
     }
 
@@ -487,6 +556,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(not(PyPy))]
     fn test_seq_count() {
         let gil = Python::acquire_gil();
         let py = gil.python();
@@ -637,6 +707,18 @@ mod test {
     }
 
     #[test]
+    fn test_extract_bytearray_to_array() {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let v: [u8; 3] = py
+            .eval("bytearray(b'abc')", None, None)
+            .unwrap()
+            .extract()
+            .unwrap();
+        assert!(&v == b"abc");
+    }
+
+    #[test]
     fn test_extract_bytearray_to_vec() {
         let gil = Python::acquire_gil();
         let py = gil.python();
@@ -658,5 +740,18 @@ mod test {
         let type_ptr = seq.as_ref();
         let seq_from = unsafe { <PySequence as PyTryFrom>::try_from_unchecked(type_ptr) };
         assert!(seq_from.list().is_ok());
+    }
+
+    #[test]
+    fn test_is_empty() {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let list = vec![1].to_object(py);
+        let seq = list.cast_as::<PySequence>(py).unwrap();
+        assert_eq!(seq.is_empty().unwrap(), false);
+        let vec: Vec<u32> = Vec::new();
+        let empty_list = vec.to_object(py);
+        let empty_seq = empty_list.cast_as::<PySequence>(py).unwrap();
+        assert_eq!(empty_seq.is_empty().unwrap(), true);
     }
 }

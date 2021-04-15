@@ -2,26 +2,22 @@
 //
 // based on Daniel Grunwald's https://github.com/dgrunwald/rust-cpython
 
-use crate::conversion::{IntoPyObject, ToBorrowedObject, ToPyObject};
 use crate::err::{self, PyResult};
 use crate::ffi::{self, Py_ssize_t};
-use crate::instance::PyObjectWithGIL;
-use crate::object::PyObject;
-use crate::python::{IntoPyPointer, Python, ToPyPointer};
-use crate::types::PyObjectRef;
+use crate::{
+    AsPyPointer, IntoPy, IntoPyPointer, PyAny, PyNativeType, PyObject, Python, ToBorrowedObject,
+    ToPyObject,
+};
 
 /// Represents a Python `list`.
 #[repr(transparent)]
-pub struct PyList(PyObject);
+pub struct PyList(PyAny);
 
-pyobject_native_type!(PyList, ffi::PyList_Type, ffi::PyList_Check);
+pyobject_native_var_type!(PyList, ffi::PyList_Type, ffi::PyList_Check);
 
 impl PyList {
-    /// Construct a new list with the given elements.
-    pub fn new<'p, T, U>(
-        py: Python<'p>,
-        elements: impl IntoIterator<Item = T, IntoIter = U>,
-    ) -> &'p PyList
+    /// Constructs a new list with the given elements.
+    pub fn new<T, U>(py: Python<'_>, elements: impl IntoIterator<Item = T, IntoIter = U>) -> &PyList
     where
         T: ToPyObject,
         U: ExactSizeIterator<Item = T>,
@@ -38,18 +34,18 @@ impl PyList {
         }
     }
 
-    /// Construct a new empty list.
+    /// Constructs a new empty list.
     pub fn empty(py: Python) -> &PyList {
         unsafe { py.from_owned_ptr::<PyList>(ffi::PyList_New(0)) }
     }
 
-    /// Gets the length of the list.
+    /// Returns the length of the list.
     pub fn len(&self) -> usize {
         // non-negative Py_ssize_t should always fit into Rust usize
         unsafe { ffi::PyList_Size(self.as_ptr()) as usize }
     }
 
-    /// Check if list is empty.
+    /// Checks if the list is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -57,10 +53,14 @@ impl PyList {
     /// Gets the item at the specified index.
     ///
     /// Panics if the index is out of range.
-    pub fn get_item(&self, index: isize) -> &PyObjectRef {
+    pub fn get_item(&self, index: isize) -> &PyAny {
+        assert!((index.abs() as usize) < self.len());
         unsafe {
-            self.py()
-                .from_borrowed_ptr(ffi::PyList_GetItem(self.as_ptr(), index as Py_ssize_t))
+            let ptr = ffi::PyList_GetItem(self.as_ptr(), index as Py_ssize_t);
+
+            // PyList_GetItem return borrowed ptr; must make owned for safety (see #890).
+            ffi::Py_INCREF(ptr);
+            self.py().from_owned_ptr(ptr)
         }
     }
 
@@ -91,7 +91,7 @@ impl PyList {
         }
     }
 
-    /// Appends an item at the list.
+    /// Appends an item to the list.
     pub fn append<I>(&self, item: I) -> PyResult<()>
     where
         I: ToBorrowedObject,
@@ -113,7 +113,7 @@ impl PyList {
         })
     }
 
-    /// Returns an iterator over the tuple items.
+    /// Returns an iterator over this list's items.
     pub fn iter(&self) -> PyListIterator {
         PyListIterator {
             list: self,
@@ -121,9 +121,14 @@ impl PyList {
         }
     }
 
-    /// Sorts the list in-place. Equivalent to python `l.sort()`
+    /// Sorts the list in-place. Equivalent to the Python expression `l.sort()`.
     pub fn sort(&self) -> PyResult<()> {
         unsafe { err::error_on_minusone(self.py(), ffi::PyList_Sort(self.as_ptr())) }
+    }
+
+    /// Reverses the list in-place. Equivalent to the Python expression `l.reverse()`.
+    pub fn reverse(&self) -> PyResult<()> {
+        unsafe { err::error_on_minusone(self.py(), ffi::PyList_Reverse(self.as_ptr())) }
     }
 }
 
@@ -134,10 +139,10 @@ pub struct PyListIterator<'a> {
 }
 
 impl<'a> Iterator for PyListIterator<'a> {
-    type Item = &'a PyObjectRef;
+    type Item = &'a PyAny;
 
     #[inline]
-    fn next(&mut self) -> Option<&'a PyObjectRef> {
+    fn next(&mut self) -> Option<&'a PyAny> {
         if self.index < self.list.len() as isize {
             let item = self.list.get_item(self.index);
             self.index += 1;
@@ -149,7 +154,7 @@ impl<'a> Iterator for PyListIterator<'a> {
 }
 
 impl<'a> std::iter::IntoIterator for &'a PyList {
-    type Item = &'a PyObjectRef;
+    type Item = &'a PyAny;
     type IntoIter = PyListIterator<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -161,50 +166,68 @@ impl<T> ToPyObject for [T]
 where
     T: ToPyObject,
 {
-    fn to_object<'p>(&self, py: Python<'p>) -> PyObject {
+    fn to_object(&self, py: Python<'_>) -> PyObject {
         unsafe {
             let ptr = ffi::PyList_New(self.len() as Py_ssize_t);
             for (i, e) in self.iter().enumerate() {
                 let obj = e.to_object(py).into_ptr();
                 ffi::PyList_SetItem(ptr, i as Py_ssize_t, obj);
             }
-            PyObject::from_owned_ptr_or_panic(py, ptr)
+            PyObject::from_owned_ptr(py, ptr)
         }
     }
 }
+
+macro_rules! array_impls {
+    ($($N:expr),+) => {
+        $(
+            impl<T> IntoPy<PyObject> for [T; $N]
+            where
+                T: ToPyObject
+            {
+                fn into_py(self, py: Python) -> PyObject {
+                    self.as_ref().to_object(py)
+                }
+            }
+        )+
+    }
+}
+
+array_impls!(
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31, 32
+);
 
 impl<T> ToPyObject for Vec<T>
 where
     T: ToPyObject,
 {
-    fn to_object<'p>(&self, py: Python<'p>) -> PyObject {
+    fn to_object(&self, py: Python<'_>) -> PyObject {
         self.as_slice().to_object(py)
     }
 }
 
-impl<T> IntoPyObject for Vec<T>
+impl<T> IntoPy<PyObject> for Vec<T>
 where
-    T: IntoPyObject + ToPyObject,
+    T: IntoPy<PyObject>,
 {
-    fn into_object(self, py: Python) -> PyObject {
+    fn into_py(self, py: Python) -> PyObject {
         unsafe {
             let ptr = ffi::PyList_New(self.len() as Py_ssize_t);
             for (i, e) in self.into_iter().enumerate() {
-                let obj = e.into_object(py).into_ptr();
+                let obj = e.into_py(py).into_ptr();
                 ffi::PyList_SetItem(ptr, i as Py_ssize_t, obj);
             }
-            PyObject::from_owned_ptr_or_panic(py, ptr)
+            PyObject::from_owned_ptr(py, ptr)
         }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::conversion::{PyTryFrom, ToPyObject};
-    use crate::instance::AsPyRef;
-    use crate::objectprotocol::ObjectProtocol;
-    use crate::python::Python;
     use crate::types::PyList;
+    use crate::Python;
+    use crate::{IntoPy, PyObject, PyTryFrom, ToPyObject};
 
     #[test]
     fn test_new() {
@@ -274,16 +297,16 @@ mod test {
 
         let cnt;
         {
-            let _pool = crate::GILPool::new();
+            let _pool = unsafe { crate::GILPool::new() };
             let v = vec![2];
             let ob = v.to_object(py);
             let list = <PyList as PyTryFrom>::try_from(ob.as_ref(py)).unwrap();
             let none = py.None();
-            cnt = none.get_refcnt();
+            cnt = none.get_refcnt(py);
             list.set_item(0, none).unwrap();
         }
 
-        assert_eq!(cnt, py.None().get_refcnt());
+        assert_eq!(cnt, py.None().get_refcnt(py));
     }
 
     #[test]
@@ -309,14 +332,14 @@ mod test {
 
         let cnt;
         {
-            let _pool = crate::GILPool::new();
+            let _pool = unsafe { crate::GILPool::new() };
             let list = PyList::empty(py);
             let none = py.None();
-            cnt = none.get_refcnt();
+            cnt = none.get_refcnt(py);
             list.insert(0, none).unwrap();
         }
 
-        assert_eq!(cnt, py.None().get_refcnt());
+        assert_eq!(cnt, py.None().get_refcnt(py));
     }
 
     #[test]
@@ -338,13 +361,13 @@ mod test {
 
         let cnt;
         {
-            let _pool = crate::GILPool::new();
+            let _pool = unsafe { crate::GILPool::new() };
             let list = PyList::empty(py);
             let none = py.None();
-            cnt = none.get_refcnt();
+            cnt = none.get_refcnt(py);
             list.append(none).unwrap();
         }
-        assert_eq!(cnt, py.None().get_refcnt());
+        assert_eq!(cnt, py.None().get_refcnt(py));
     }
 
     #[test]
@@ -369,10 +392,8 @@ mod test {
         let v = vec![1, 2, 3, 4];
         let ob = v.to_object(py);
         let list = <PyList as PyTryFrom>::try_from(ob.as_ref(py)).unwrap();
-        let mut i = 0;
-        for el in list {
-            i += 1;
-            assert_eq!(i, el.extract::<i32>().unwrap());
+        for (i, item) in list.iter().enumerate() {
+            assert_eq!((i + 1) as i32, item.extract::<i32>().unwrap());
         }
     }
 
@@ -402,5 +423,32 @@ mod test {
         assert_eq!(3, list.get_item(1).extract::<i32>().unwrap());
         assert_eq!(5, list.get_item(2).extract::<i32>().unwrap());
         assert_eq!(7, list.get_item(3).extract::<i32>().unwrap());
+    }
+
+    #[test]
+    fn test_reverse() {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let v = vec![2, 3, 5, 7];
+        let list = PyList::new(py, &v);
+        assert_eq!(2, list.get_item(0).extract::<i32>().unwrap());
+        assert_eq!(3, list.get_item(1).extract::<i32>().unwrap());
+        assert_eq!(5, list.get_item(2).extract::<i32>().unwrap());
+        assert_eq!(7, list.get_item(3).extract::<i32>().unwrap());
+        list.reverse().unwrap();
+        assert_eq!(7, list.get_item(0).extract::<i32>().unwrap());
+        assert_eq!(5, list.get_item(1).extract::<i32>().unwrap());
+        assert_eq!(3, list.get_item(2).extract::<i32>().unwrap());
+        assert_eq!(2, list.get_item(3).extract::<i32>().unwrap());
+    }
+
+    #[test]
+    fn test_array_into_py() {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let array: PyObject = [1, 2].into_py(py);
+        let list = <PyList as PyTryFrom>::try_from(array.as_ref(py)).unwrap();
+        assert_eq!(1, list.get_item(0).extract::<i32>().unwrap());
+        assert_eq!(2, list.get_item(1).extract::<i32>().unwrap());
     }
 }
